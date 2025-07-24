@@ -1,0 +1,208 @@
+from nibabel.spatialimages import SpatialImage
+import numpy as np
+import os
+import logging
+from pathlib import Path
+
+_LOGGER = logging.getLogger(__name__)
+
+NIFTI_MIMES = ['application/x-nifti', 'image/x.nifti']
+NIFTI_EXTENSIONS = ('.nii', '.nii.gz')
+_AXIS_MAPPING = {
+    'sagittal': 0,
+    'coronal': 1,
+    'axial': 2
+}
+
+
+def slice_location_to_slice_index(data: SpatialImage,
+                                  slice_location: float,
+                                  slice_axis: int,
+                                  ) -> int:
+    """
+    Convert a slice location in world coordinates to a slice index in the NIfTI image.
+    """
+    if slice_axis not in (0, 1, 2):
+        raise ValueError("slice_axis must be 0, 1 or 2")
+
+    origin = data.affine[:3, 3]  # Location at voxel [0, 0, 0] in world coordinates. (translation vector)
+    rotation_matrix = data.affine[:3, :3]
+
+    # Get the directional vectors from the rotation matrix
+    axis_vector = rotation_matrix[:, slice_axis]  # This is the direction of the slice axis in world coordinates
+
+    # check that axis_vector is zero along other axes
+    if not np.isclose(axis_vector[(slice_axis + 1) % 3], 0) or not np.isclose(axis_vector[(slice_axis + 2) % 3], 0):
+        raise ValueError("Slice axis vector is not aligned with the specified slice axis.")
+
+    slice_index = (slice_location-origin[slice_axis]) / axis_vector[slice_axis]
+    slice_index = int(round(slice_index))
+    return slice_index
+
+
+def coplanar_vector_to_slice_axis(data: SpatialImage,
+                                  coplanar_vector: np.ndarray,
+                                  ) -> int:
+    """
+    IMPORTANT: ASSUMES coplanar_vector is not oblique to the image plane
+        (i.e., the line is parallel to one of the image axes).
+    """
+    if not isinstance(coplanar_vector, np.ndarray) or coplanar_vector.ndim != 1 or coplanar_vector.size != 3:
+        raise ValueError("coplanar_vector must be a 3-element numpy array")
+
+    rotation_matrix = data.affine[:3, :3]
+    coplanar_vector = coplanar_vector / np.linalg.norm(coplanar_vector)  # Normalize the vector
+
+    # Find the slice axis that is most aligned with the coplanar vector
+    dot_products = np.abs(rotation_matrix.T @ coplanar_vector)
+    slice_axis = np.argmin(dot_products)
+
+    return slice_axis
+
+
+def get_slice_location_from_slice_axis(data: SpatialImage,
+                                       world_point: np.ndarray,
+                                       slice_axis: int) -> float:
+    """    Get the slice location in world coordinates from a point and the slice axis.
+    """
+    if not isinstance(world_point, np.ndarray) or world_point.ndim != 1 or world_point.size != 3:
+        raise ValueError("world_point must be a 3-element numpy array")
+
+    if slice_axis not in (0, 1, 2):
+        raise ValueError("slice_axis must be 0, 1 or 2")
+
+    rotation_matrix = data.affine[:3, :3]
+    axis_vector = rotation_matrix[:, slice_axis]  # This is the direction of the slice axis in world coordinates
+    world_slice_axis = np.argmax(np.abs(axis_vector))
+    return world_point[world_slice_axis]
+
+
+def line_to_slice_index(data: SpatialImage,
+                        world_point1: np.ndarray | None = None,
+                        world_point2: np.ndarray | None = None,
+                        coplanar_vector: np.ndarray | None = None) -> tuple[int, int]:
+    """
+    Convert a line defined by two points OR coplanar_vector in world coordinates to a slice index.
+    IMPORTANT: Assumes the line is coplanar with the image plane (i.e., not oblique and aligned with the image axes).
+    """
+    # either world_point1 and world_point2 must be provided, or coplanar_vector must be provided
+    if (world_point1 is None or world_point2 is None) and coplanar_vector is None:
+        raise ValueError("Either world_point1 and world_point2 or coplanar_vector must be provided")
+
+    if world_point1 is not None:
+        coplanar_vector = world_point2 - world_point1
+
+    slice_axis = coplanar_vector_to_slice_axis(data, coplanar_vector)
+    slice_location = get_slice_location_from_slice_axis(data, world_point1, slice_axis)
+    slice_index = slice_location_to_slice_index(data,
+                                                slice_location=slice_location,
+                                                slice_axis=slice_axis
+                                                )
+
+    return slice_index, slice_axis
+
+
+def get_slice_from_line(data: SpatialImage,
+                        world_point1: np.ndarray,
+                        world_point2: np.ndarray) -> np.ndarray:
+    """
+    Get the slice 2D image from a line defined by two points in world coordinates.
+    """
+    slice_index, slice_axis = line_to_slice_index(data, world_point1, world_point2)
+    return get_slice(data, slice_index, slice_axis)
+
+
+def get_slice(data: SpatialImage,
+              slice_index: int,
+              slice_axis: int) -> np.ndarray:
+    """
+    Get a 2D slice from a 3D NIfTI volume based on the slice index and axis.
+
+    Args:
+        data (SpatialImage): The NIfTI image data whose slice is to be extracted.
+        slice_index (int): The index of the slice to extract.
+        slice_axis (int): The axis along which to extract the slice (0 for x, 1 for y, 2 for z).
+
+    Returns:
+        np.ndarray: The extracted 2D slice image with shape (W, H).
+    """
+    # Check the on-disk data order ('C' or 'F')
+    # 'C' means C-contiguous (row-major), fastest changing is the first index.
+    # Slicing the first axis (e.g., r.dataobj[0, :, :]) is fastest for 'C' order.
+    # 'F' means Fortran-contiguous (column-major), fastest changing is the last index.
+    # Slicing the last axis (e.g., r.dataobj[:, :, 0]) is fastest for 'F' order.
+    dataorder = data.dataobj.order
+
+    if slice_axis == 0:
+        if dataorder == 'C':
+            slice_image = data.dataobj[slice_index, :, :]
+        else:
+            slice_image = data.get_fdata()[slice_index, :, :]
+    elif slice_axis == 1:
+        slice_image = data.get_fdata()[:, slice_index, :]
+    elif slice_axis == 2:
+        if dataorder == 'F':
+            slice_image = data.dataobj[:, :, slice_index]
+        else:
+            slice_image = data.get_fdata()[:, :, slice_index]
+    else:
+        raise ValueError("Invalid slice axis")
+
+    return slice_image
+
+
+def is_nifti_file(file_path: Path | str) -> bool:
+    """
+    Check if the file is a NIfTI file based on its extension, mimetype, or magic number.
+    """
+    if isinstance(file_path, str):
+        file_path = Path(file_path)
+    # Check file extension
+    if file_path.name.lower().endswith(NIFTI_EXTENSIONS):
+        return True
+
+    # Check if file exists before trying to read magic number
+    if not file_path.exists():
+        return False
+
+    # Check magic number
+    try:
+        import magic
+        import gzip
+        file_type = magic.from_file(str(file_path), mime=True)
+        if file_type in NIFTI_MIMES:
+            return True
+        if file_type == 'application/gzip':
+            with gzip.open(file_path, 'rb') as f:
+                subfiletype = magic.from_buffer(f.read(1024), mime=True)
+            if subfiletype in NIFTI_MIMES:
+                return True
+    except ImportError:
+        # If the magic module is not available, we cannot check magic numbers
+        _LOGGER.warning("The 'magic' module is not available. Cannot check magic numbers for NIfTI files.")
+    except (IOError, OSError):
+        return False
+
+    return False
+
+
+def axis_name_to_axis_index(data: SpatialImage,
+                            axis_name: str) -> int:
+    """
+    Convert an axis name to its corresponding index in the NIfTI image.
+    ASSUMES data indices are aligned with the axis.
+
+    Args:
+        data (SpatialImage): The NIfTI image data.
+        axis_name (str): The name of the axis ('sagittal', 'coronal', 'axial').
+
+    Returns:
+        int: The index of the axis (0, 1, or 2).
+    """
+    rotation_matrix = data.affine[:3, :3]
+    axis_name = axis_name.lower()
+    idx = _AXIS_MAPPING.get(axis_name)
+    if idx is None:
+        raise ValueError(f"Unknown axis name: {axis_name}. Expected one of {set(_AXIS_MAPPING.keys())}.")
+    axis_index = np.argmax(np.abs(rotation_matrix[:, idx]))
+    return axis_index
