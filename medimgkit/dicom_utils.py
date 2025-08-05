@@ -1,5 +1,6 @@
 from pydicom.pixels import pixel_array
 import pydicom
+import pydicom.dataset
 from pydicom.uid import generate_uid
 from typing import Sequence, Generator, IO, TypeVar, Generic
 import warnings
@@ -14,17 +15,19 @@ from collections import defaultdict
 import uuid
 import hashlib
 from tqdm import tqdm
-
+from .io_utils import peek, is_io_object
 import pydicom.uid
 
 _LOGGER = logging.getLogger(__name__)
 
 CLEARED_STR = "CLEARED_BY_DATAMINT"
 
+
 def set_cleared_string(value: str):
     """Set the cleared string value."""
     global CLEARED_STR
     CLEARED_STR = value
+
 
 T = TypeVar('T')
 
@@ -149,12 +152,17 @@ def anonymize_dicom(ds: pydicom.Dataset,
     return ds
 
 
-def is_dicom(f: str | Path | BytesIO) -> bool:
-    if isinstance(f, BytesIO):
-        fp = BytesIO(f.getbuffer())  # Avoid modifying the original BytesIO object
-        fp.read(128)  # preamble
-
-        return fp.read(4) == b"DICM"
+def is_dicom(f: str | Path | BytesIO | bytes) -> bool:
+    if isinstance(f, (BytesIO, bytes)):
+        if isinstance(f, bytes):
+            if len(f) < 132:
+                return False
+            databytes = f[128:132]
+        else:
+            with peek(f):  # Avoid modifying the original BytesIO object
+                f.read(128)  # preamble
+                databytes = f.read(4)
+        return databytes == b"DICM"
 
     if isinstance(f, Path):
         f = str(f)
@@ -245,10 +253,17 @@ def assemble_dicoms(files_path: list[str | IO],
         A generator that yields the merged DICOM files.
     """
     dicoms_map = defaultdict(list)
-    
+
     for file_path in tqdm(files_path, desc="Reading DICOMs metadata", unit="file"):
-        dicom = pydicom.dcmread(file_path,
-                                specific_tags=['SeriesInstanceUID', 'InstanceNumber', 'Rows', 'Columns'])
+        if is_io_object(file_path):
+            with peek(file_path):
+                dicom = pydicom.dcmread(file_path,
+                                        specific_tags=['SeriesInstanceUID', 'InstanceNumber', 'Rows', 'Columns'],
+                                        stop_before_pixels=True)
+        else:
+            dicom = pydicom.dcmread(file_path,
+                                    specific_tags=['SeriesInstanceUID', 'InstanceNumber', 'Rows', 'Columns'],
+                                    stop_before_pixels=True)
         series_uid = dicom.get('SeriesInstanceUID', None)
         if series_uid is None:
             # generate a random uid
@@ -257,18 +272,16 @@ def assemble_dicoms(files_path: list[str | IO],
         rows = dicom.get('Rows', None)
         columns = dicom.get('Columns', None)
         dicoms_map[series_uid].append((instance_number, file_path, rows, columns))
-        if hasattr(file_path, "seek"):
-            file_path.seek(0)
-    
+
     # Validate that all DICOMs with the same SeriesInstanceUID have matching dimensions
     for series_uid, dicom_list in dicoms_map.items():
         if len(dicom_list) <= 1:
             continue
-            
+
         # Get dimensions from first DICOM
         first_rows = dicom_list[0][2]
         first_columns = dicom_list[0][3]
-        
+
         # Check all other DICOMs have the same dimensions
         for instance_number, file_path, rows, columns in dicom_list:
             if rows != first_rows or columns != first_columns:
@@ -283,7 +296,7 @@ def assemble_dicoms(files_path: list[str | IO],
     # filter out the two last elements of the tuple (rows, columns)
     dicoms_map = {fr_uid: [(instance_number, file_path) for instance_number, file_path, _, _ in dicoms]
                   for fr_uid, dicoms in dicoms_map.items()}
-    
+
     gen = _generate_merged_dicoms(dicoms_map, return_as_IO=return_as_IO)
     return GeneratorWithLength(gen, len(dicoms_map))
 

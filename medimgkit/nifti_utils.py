@@ -1,8 +1,9 @@
 from nibabel.spatialimages import SpatialImage
 import numpy as np
-import os
 import logging
 from pathlib import Path
+import nibabel as nib
+import gzip
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -14,6 +15,42 @@ _AXIS_MAPPING = {
     'axial': 2
 }
 
+def read_nifti(file_path: str, mimetype: str | None = None) -> np.ndarray:
+    """
+    Read a NIfTI file and return the image data in standardized format.
+
+    Args:
+        file_path: Path to the NIfTI file (.nii or .nii.gz)
+        mimetype: Optional MIME type of the file. If provided, it can help in determining how to read the file.
+
+    Returns:
+        np.ndarray: Image data with shape (#frames, C, H, W)
+    """
+    from nibabel.filebasedimages import ImageFileError
+    try:
+        imgs = nib.load(file_path).get_fdata()  # shape: (W, H, #frame) or (W, H)
+    except ImageFileError as e:
+        if mimetype is None:
+            raise e
+        # has_ext = os.path.splitext(file_path)[1] != ''
+        if mimetype == 'application/gzip':
+            with gzip.open(file_path, 'rb') as f:
+                imgs = nib.Nifti1Image.from_stream(f).get_fdata()
+        elif mimetype in ('image/x.nifti', 'application/x-nifti'):
+            with open(file_path, 'rb') as f:
+                imgs = nib.Nifti1Image.from_stream(f).get_fdata()
+        else:
+            raise e
+    if imgs.ndim == 2:
+        imgs = imgs.transpose(1, 0)
+        imgs = imgs[np.newaxis, np.newaxis]
+    elif imgs.ndim == 3:
+        imgs = imgs.transpose(2, 1, 0)
+        imgs = imgs[:, np.newaxis]
+    else:
+        raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim}")
+
+    return imgs
 
 def slice_location_to_slice_index(data: SpatialImage,
                                   slice_location: float,
@@ -185,6 +222,38 @@ def is_nifti_file(file_path: Path | str) -> bool:
 
     return False
 
+def check_nifti_magic_numbers(data: bytes) -> bool:
+    """
+    Check if the provided byte data contains NIfTI magic numbers.
+    """
+    # NIfTI-1 magic numbers
+    NIFTI1_MAGIC = b'\x6e\x2b\x31\x00'  # "n+1\0"
+    NIFTI1_MAGIC_ALT = b'\x6e\x69\x31\x00'  # "ni1\0"
+
+    # NIfTI-2 magic numbers  
+    NIFTI2_MAGIC = b'\x6e\x2b\x32\x00'  # "n+2\0"
+    NIFTI2_MAGIC_ALT = b'\x6e\x69\x32\x00'  # "ni2\0"
+
+    if len(data) < 4:
+        return False
+
+    # Check for NIfTI-1 magic numbers at offset 344
+    if len(data) >= 348:
+        magic_at_344 = data[344:348]
+        if magic_at_344 in (NIFTI1_MAGIC, NIFTI1_MAGIC_ALT):
+            return True
+
+    # Check for NIfTI-2 magic numbers at offset 4
+    magic_at_4 = data[4:8]
+    if magic_at_4 in (NIFTI2_MAGIC, NIFTI2_MAGIC_ALT):
+        return True
+
+    # Check for magic numbers at the beginning (some implementations)
+    magic_at_0 = data[0:4]
+    if magic_at_0 in (NIFTI1_MAGIC, NIFTI1_MAGIC_ALT, NIFTI2_MAGIC, NIFTI2_MAGIC_ALT):
+        return True
+
+    return False
 
 def axis_name_to_axis_index(data: SpatialImage,
                             axis_name: str) -> int:

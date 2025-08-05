@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medimgkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A comprehensive toolkit for medical image processing, including DICOM, NIfTI, and multi-format I/O utilities"
 readme = "README.md"
 license = {text = "MIT"}
@@ -32,6 +32,7 @@ dependencies = [
     "opencv-python>=4.5.0",
     "tqdm>=4.60.0",
     "python-magic>=0.4.24",
+    'puremagic>=1.30'
 ]
 
 [project.optional-dependencies]
