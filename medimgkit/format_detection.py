@@ -45,12 +45,18 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
     return DEFAULT_MIME_TYPE
 
 
-def guess_type(name: str | Path | IO, use_magic=True):
-    if is_io_object(name):
+def guess_type(name: str | Path | IO | bytes, use_magic=True):
+    if isinstance(name, bytes):
+        data_bytes = name
+        name = ''
+        io_obj = None
+    elif is_io_object(name):
         io_obj = name
         name = getattr(name, 'name', '')
+        data_bytes = None
     else:
         io_obj = None
+        data_bytes = None
 
     name = Path(name).expanduser()
     suffix = name.suffix
@@ -64,12 +70,13 @@ def guess_type(name: str | Path | IO, use_magic=True):
 
     # Try magic if requested
     if use_magic:
-        if io_obj is not None:
-            with peek(io_obj):  # Ensure we don't change the stream position
-                data_bytes = io_obj.read(2048)
-        else:
-            with open(name, 'rb') as f:
-                data_bytes = f.read(2048)
+        if data_bytes is None:
+            if io_obj is not None:
+                with peek(io_obj):  # Ensure we don't change the stream position
+                    data_bytes = io_obj.read(2048)
+            else:
+                with open(name, 'rb') as f:
+                    data_bytes = f.read(2048)
         mime_type = magic_from_buffer(data_bytes, mime=True).strip()
         if mime_type != DEFAULT_MIME_TYPE:
             if not suffix:
