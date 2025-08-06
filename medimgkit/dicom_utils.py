@@ -21,6 +21,7 @@ import pydicom.uid
 _LOGGER = logging.getLogger(__name__)
 
 CLEARED_STR = "CLEARED_BY_DATAMINT"
+REPORT_MODALITIES = {'SR', 'DOC', 'KO', 'PR', 'ESR'}
 
 
 def set_cleared_string(value: str):
@@ -152,16 +153,16 @@ def anonymize_dicom(ds: pydicom.Dataset,
     return ds
 
 
-def is_dicom(f: str | Path | BytesIO | bytes) -> bool:
-    if isinstance(f, (BytesIO, bytes)):
-        if isinstance(f, bytes):
-            if len(f) < 132:
-                return False
-            databytes = f[128:132]
-        else:
-            with peek(f):  # Avoid modifying the original BytesIO object
-                f.read(128)  # preamble
-                databytes = f.read(4)
+def is_dicom(f: str | Path | IO | bytes) -> bool:
+    if isinstance(f, bytes):
+        if len(f) < 132:
+            return False
+        databytes = f[128:132]
+        return databytes == b"DICM"
+    elif is_io_object(f):
+        with peek(f):  # Avoid modifying the original BytesIO object
+            f.read(128)  # preamble
+            databytes = f.read(4)
         return databytes == b"DICM"
 
     if isinstance(f, Path):
@@ -800,3 +801,37 @@ def convert_slice_location_to_slice_index_from_dicom(ds: pydicom.Dataset,
         raise ValueError(f"Slice index {slice_index} is negative. Check slice location and orientation.")
 
     return slice_index, slice_axis
+
+
+def is_dicom_report(file_path: str | IO) -> bool:
+    """
+    Check if a DICOM file is a report (e.g., Structured Report).
+
+    Args:
+        file_path: Path to the DICOM file or file-like object.
+
+    Returns:
+        bool: True if the DICOM file is a report, False otherwise.
+    """
+    try:
+        if not is_dicom(file_path):
+            return False
+
+        if is_io_object(file_path):
+            with peek(file_path):
+                ds = pydicom.dcmread(file_path,
+                                     specific_tags=['Modality'],
+                                     stop_before_pixels=True)
+        else:
+            ds = pydicom.dcmread(file_path,
+                                 specific_tags=['Modality'],
+                                 stop_before_pixels=True)
+        modality = getattr(ds, 'Modality', None)
+
+        # Common report modalities
+        # SR=Structured Report, DOC=Document, KO=Key Object, PR=Presentation State
+
+        return modality in REPORT_MODALITIES
+    except Exception as e:
+        _LOGGER.warning(f"Error checking if DICOM is a report: {e}")
+        return False
