@@ -7,11 +7,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 _LOGGER = logging.getLogger(__name__)
 
-IMAGE_EXTS = ('.png', '.jpg', '.jpeg')
-NII_EXTS = ('.nii', '.nii.gz')
-VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
-
-
 def is_io_object(obj):
     """
     Check if an object is a file-like object.

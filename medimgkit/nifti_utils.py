@@ -8,14 +8,35 @@ import gzip
 _LOGGER = logging.getLogger(__name__)
 
 NIFTI_MIMES = ['application/x-nifti', 'image/x.nifti']
-NIFTI_EXTENSIONS = ('.nii', '.nii.gz')
+NIFTI_EXTENSIONS = ('.nii', '.hdr')
 _AXIS_MAPPING = {
     'sagittal': 0,
     'coronal': 1,
     'axial': 2
 }
 
-def read_nifti(file_path: str, mimetype: str | None = None) -> np.ndarray:
+
+def _read_slice_or_full(nibdata: SpatialImage,
+                        slice_index: int | None,
+                        slice_axis: int | None) -> np.ndarray:
+    """
+    Read a slice or the full volume from a NIfTI image.
+    """
+    if slice_index is not None:
+        if slice_axis is None:
+            raise ValueError("slice_axis must be provided if slice_index is provided")
+        return get_slice(nibdata, slice_index, slice_axis)
+
+    if slice_axis is not None:
+        raise ValueError("slice_index must be provided if slice_axis is provided")
+
+    return nibdata.get_fdata()
+
+
+def read_nifti(file_path: str,
+               mimetype: str | None = None,
+               slice_index: int | None = None,
+               slice_axis: int | None = None) -> np.ndarray:
     """
     Read a NIfTI file and return the image data in standardized format.
 
@@ -26,31 +47,43 @@ def read_nifti(file_path: str, mimetype: str | None = None) -> np.ndarray:
     Returns:
         np.ndarray: Image data with shape (#frames, C, H, W)
     """
+    if slice_index is not None and slice_axis is None:
+        raise ValueError("slice_axis must be provided if slice_index is provided")
+    if slice_axis is not None and slice_index is None:
+        raise ValueError("slice_index must be provided if slice_axis is provided")
+
     from nibabel.filebasedimages import ImageFileError
     try:
-        imgs = nib.load(file_path).get_fdata()  # shape: (W, H, #frame) or (W, H)
+        nibdata = nib.load(file_path)
+        imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
     except ImageFileError as e:
         if mimetype is None:
             raise e
         # has_ext = os.path.splitext(file_path)[1] != ''
         if mimetype == 'application/gzip':
             with gzip.open(file_path, 'rb') as f:
-                imgs = nib.Nifti1Image.from_stream(f).get_fdata()
-        elif mimetype in ('image/x.nifti', 'application/x-nifti'):
+                nibdata = nib.Nifti1Image.from_stream(f)
+                imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+        elif mimetype in NIFTI_MIMES:
             with open(file_path, 'rb') as f:
-                imgs = nib.Nifti1Image.from_stream(f).get_fdata()
+                nibdata = nib.Nifti1Image.from_stream(f)
+                imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
         else:
             raise e
     if imgs.ndim == 2:
         imgs = imgs.transpose(1, 0)
-        imgs = imgs[np.newaxis, np.newaxis]
-    elif imgs.ndim == 3:
+        if slice_index is None:
+            imgs = imgs[np.newaxis, np.newaxis]
+        else:
+            imgs = imgs[np.newaxis]
+    elif imgs.ndim == 3 and slice_index is None:
         imgs = imgs.transpose(2, 1, 0)
         imgs = imgs[:, np.newaxis]
     else:
         raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim}")
 
     return imgs
+
 
 def slice_location_to_slice_index(data: SpatialImage,
                                   slice_location: float,
@@ -222,6 +255,7 @@ def is_nifti_file(file_path: Path | str) -> bool:
 
     return False
 
+
 def check_nifti_magic_numbers(data: bytes) -> bool:
     """
     Check if the provided byte data contains NIfTI magic numbers.
@@ -230,7 +264,7 @@ def check_nifti_magic_numbers(data: bytes) -> bool:
     NIFTI1_MAGIC = b'\x6e\x2b\x31\x00'  # "n+1\0"
     NIFTI1_MAGIC_ALT = b'\x6e\x69\x31\x00'  # "ni1\0"
 
-    # NIfTI-2 magic numbers  
+    # NIfTI-2 magic numbers
     NIFTI2_MAGIC = b'\x6e\x2b\x32\x00'  # "n+2\0"
     NIFTI2_MAGIC_ALT = b'\x6e\x69\x32\x00'  # "ni2\0"
 
@@ -254,6 +288,7 @@ def check_nifti_magic_numbers(data: bytes) -> bool:
         return True
 
     return False
+
 
 def axis_name_to_axis_index(data: SpatialImage,
                             axis_name: str) -> int:

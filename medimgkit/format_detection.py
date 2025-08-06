@@ -1,4 +1,4 @@
-from .nifti_utils import check_nifti_magic_numbers, NIFTI_MIMES
+from .nifti_utils import check_nifti_magic_numbers, NIFTI_MIMES, NIFTI_EXTENSIONS
 import mimetypes
 from pathlib import Path
 from .dicom_utils import is_dicom
@@ -7,6 +7,7 @@ from typing import IO
 from .io_utils import is_io_object, peek
 
 _LOGGER = logging.getLogger(__name__)
+DEFAULT_MIME_TYPE = 'application/octet-stream'
 
 
 def guess_extension(type: str) -> str | None:
@@ -21,7 +22,7 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
     try:
         import magic
         mime_type = magic.from_buffer(buffer, mime=mime)
-        if mime_type != 'application/octet-stream':
+        if mime_type != DEFAULT_MIME_TYPE:
             return mime_type
     except ImportError:
         pass
@@ -41,22 +42,25 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
 
     _LOGGER.info('Unable to determine MIME type from buffer, returning default mimetype')
 
-    return 'application/octet-stream'
+    return DEFAULT_MIME_TYPE
 
 
 def guess_type(name: str | Path | IO, use_magic=True):
     if is_io_object(name):
-        io_obj: IO = name
-        name = getattr(name, 'name', None)
-
+        io_obj = name
+        name = getattr(name, 'name', '')
     else:
         io_obj = None
 
-    # Try mimetypes first if we have a name
-    if name:
-        gtype = mimetypes.guess_type(name, strict=False)
-        if gtype[0]:
-            return gtype
+    name = Path(name).expanduser()
+    suffix = name.suffix
+
+    if suffix in ('.npy', '.npz'):
+        return 'application/x-numpy-data', suffix
+    if suffix == '.gz':
+        return 'application/gzip', suffix
+    if suffix in NIFTI_EXTENSIONS:
+        return 'image/x.nifti', suffix
 
     # Try magic if requested
     if use_magic:
@@ -66,7 +70,12 @@ def guess_type(name: str | Path | IO, use_magic=True):
         else:
             with open(name, 'rb') as f:
                 data_bytes = f.read(2048)
-        mime_type = magic_from_buffer(data_bytes, mime=True)
-        return mime_type, guess_extension(mime_type)
+        mime_type = magic_from_buffer(data_bytes, mime=True).strip()
+        if mime_type != DEFAULT_MIME_TYPE:
+            if not suffix:
+                suffix = guess_extension(mime_type)
+            return mime_type, suffix
 
-    return None, None
+    mime_type, encoding = mimetypes.guess_type(name, strict=False)
+
+    return mime_type, suffix
