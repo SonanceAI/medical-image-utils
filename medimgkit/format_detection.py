@@ -9,13 +9,18 @@ from .io_utils import is_io_object, peek
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_MIME_TYPE = 'application/octet-stream'
 
+_MIME_MAP = {
+    'application/x-numpy-data': '.npy',
+    'application/x-nifti-gz': '.nii.gz',
+}
+_MIME_MAP.update({k: '.nii' for k in NIFTI_MIMES})
+
 
 def guess_extension(type: str) -> str | None:
     ext = mimetypes.guess_extension(type, strict=False)
-    if ext is None:
-        if type in NIFTI_MIMES:
-            return ".nii"
-    return ext
+    if ext:
+        return ext
+    return _MIME_MAP.get(type, ext)
 
 
 def magic_from_buffer(buffer: bytes, mime=True) -> str:
