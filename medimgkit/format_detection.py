@@ -5,6 +5,8 @@ from .dicom_utils import is_dicom
 import logging
 from typing import IO
 from .io_utils import is_io_object, peek
+import gzip
+import io
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_MIME_TYPE = 'application/octet-stream'
@@ -50,7 +52,8 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
     return DEFAULT_MIME_TYPE
 
 
-def guess_type(name: str | Path | IO | bytes, use_magic=True):
+def guess_type(name: str | Path | IO | bytes,
+               use_magic=True):
     if isinstance(name, bytes):
         data_bytes = name
         name = ''
@@ -91,3 +94,37 @@ def guess_type(name: str | Path | IO | bytes, use_magic=True):
     mime_type, encoding = mimetypes.guess_type(name, strict=False)
 
     return mime_type, suffix
+
+
+def guess_typez(name: str | Path | IO | bytes,
+                use_magic=True) -> tuple[list[str | None], str | None]:
+    """
+    Guess the MIME type and file extension of a file or file-like object,
+    handling compressed files properly.
+
+    Args:
+        name: The file path, file-like object, or byte data.
+        use_magic: Whether to use magic library for MIME type detection.
+
+    Returns:
+        A tuple of (MIME type, file extension).
+    """
+    mime_type, suffix = guess_type(name, use_magic=use_magic)
+    if mime_type not in ('application/gzip', 'application/x-gzip'):
+        return [mime_type], suffix
+
+    # Handle gzip files
+    if is_io_object(name):
+        with peek(name) as io_obj:
+            with gzip.open(io_obj, 'rb') as gz:
+                mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
+    elif isinstance(name, bytes):
+        with gzip.open(io_obj := io.BytesIO(name), 'rb') as gz:
+            mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
+    else:
+        with gzip.open(name, 'rb') as gz:
+            mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
+
+    if suffix2 is None:
+        suffix2 = ''
+    return [mime_type2, mime_type], suffix2+suffix
