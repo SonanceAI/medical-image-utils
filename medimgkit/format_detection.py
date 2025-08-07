@@ -87,11 +87,11 @@ def guess_type(name: str | Path | IO | bytes,
                     data_bytes = f.read(2048)
         mime_type = magic_from_buffer(data_bytes, mime=True).strip()
         if mime_type != DEFAULT_MIME_TYPE:
-            if not suffix:
-                suffix = guess_extension(mime_type)
+            suffix = guess_extension(mime_type)
             return mime_type, suffix
 
     mime_type, encoding = mimetypes.guess_type(name, strict=False)
+    suffix = guess_extension(mime_type) if mime_type else None
 
     return mime_type, suffix
 
