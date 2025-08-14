@@ -7,7 +7,8 @@ import gzip
 
 _LOGGER = logging.getLogger(__name__)
 
-NIFTI_MIMES = ['application/x-nifti', 'image/x.nifti']
+DEFAULT_NIFTI_MIME = 'application/nifti'
+NIFTI_MIMES = ['application/x-nifti', 'image/x.nifti', 'application/nifti']
 NIFTI_EXTENSIONS = ('.nii', '.hdr')
 _AXIS_MAPPING = {
     'sagittal': 0,

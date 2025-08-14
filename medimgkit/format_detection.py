@@ -1,4 +1,4 @@
-from .nifti_utils import check_nifti_magic_numbers, NIFTI_MIMES, NIFTI_EXTENSIONS
+from .nifti_utils import check_nifti_magic_numbers, NIFTI_MIMES, NIFTI_EXTENSIONS, DEFAULT_NIFTI_MIME
 import mimetypes
 from pathlib import Path
 from .dicom_utils import is_dicom
@@ -42,7 +42,7 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
         pass
 
     if check_nifti_magic_numbers(buffer):
-        return 'image/x.nifti'
+        return DEFAULT_NIFTI_MIME
 
     if is_dicom(buffer):
         return 'application/dicom'
@@ -74,7 +74,7 @@ def guess_type(name: str | Path | IO | bytes,
     if suffix == '.gz':
         return 'application/gzip', suffix
     if suffix in NIFTI_EXTENSIONS:
-        return 'image/x.nifti', suffix
+        return DEFAULT_NIFTI_MIME, suffix
 
     # Try magic if requested
     if use_magic:
