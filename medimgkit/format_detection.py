@@ -60,8 +60,14 @@ def guess_type(name: str | Path | IO | bytes,
         io_obj = None
     elif is_io_object(name):
         io_obj = name
-        name = getattr(name, 'name', '')
         data_bytes = None
+        if isinstance(io_obj, gzip.GzipFile):
+            if io_obj.name.endswith('.gz'):
+                name = io_obj.name[:-3]
+            else:
+                name = io_obj.name
+        else:
+            name = getattr(name, 'name', '')
     else:
         io_obj = None
         data_bytes = None
@@ -119,7 +125,7 @@ def guess_typez(name: str | Path | IO | bytes,
             with gzip.open(io_obj, 'rb') as gz:
                 mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
     elif isinstance(name, bytes):
-        with gzip.open(io_obj := io.BytesIO(name), 'rb') as gz:
+        with gzip.open(io.BytesIO(name), 'rb') as gz:
             mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
     else:
         with gzip.open(name, 'rb') as gz:
