@@ -3,6 +3,8 @@ import pydicom
 import pydicom.dataset
 import pydicom.datadict
 from pydicom.uid import generate_uid
+import pydicom.uid
+import pydicom.multival
 from typing import Sequence, Generator, IO, TypeVar, Generic
 import warnings
 from copy import deepcopy
@@ -17,7 +19,6 @@ import uuid
 import hashlib
 from tqdm import tqdm
 from .io_utils import peek, is_io_object
-import pydicom.uid
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -836,3 +837,84 @@ def is_dicom_report(file_path: str | IO) -> bool:
     except Exception as e:
         _LOGGER.warning(f"Error checking if DICOM is a report: {e}")
         return False
+
+
+def detect_dicomdir(path: Path) -> Path | None:
+    """
+    Detect if a DICOMDIR file exists in the given directory.
+    
+    Args:
+        path: Directory path to search for DICOMDIR
+        
+    Returns:
+        Path to DICOMDIR file if found, None otherwise
+    """
+    if not path.is_dir():
+        return None
+        
+    # Common DICOMDIR filenames (case-insensitive)
+    dicomdir_names = ['DICOMDIR', 'dicomdir', 'DicomDir', 'DICOM_DIR']
+    
+    for name in dicomdir_names:
+        dicomdir_path = path / name
+        if dicomdir_path.exists() and dicomdir_path.is_file() and is_dicom(dicomdir_path):
+            _LOGGER.debug(f"Found DICOMDIR file: {dicomdir_path}")
+            return dicomdir_path
+    
+    return None
+
+
+def parse_dicomdir_files(dicomdir_path: Path) -> list[Path]:
+    """
+    Parse a DICOMDIR file and extract referenced image file paths.
+    
+    Args:
+        dicomdir_path: Path to the DICOMDIR file
+        
+    Returns:
+        List of absolute paths to DICOM files referenced in the DICOMDIR
+        
+    Raises:
+        ImportError: If pydicom is not available
+        Exception: If DICOMDIR parsing fails
+    """
+    try:
+        # Read the DICOMDIR file
+        dicomdir_ds = pydicom.dcmread(str(dicomdir_path))
+        
+        if 'DirectoryRecordSequence' not in dicomdir_ds:
+            _LOGGER.warning(f"No DirectoryRecordSequence found in DICOMDIR: {dicomdir_path}")
+            return []
+        
+        referenced_files = []
+        dicomdir_root = dicomdir_path.parent
+        
+        # Parse directory records to find IMAGE records
+        for record in dicomdir_ds.DirectoryRecordSequence:
+            if hasattr(record, 'DirectoryRecordType') and record.DirectoryRecordType == 'IMAGE':
+                # Extract Referenced File ID (0004,1500)
+                if hasattr(record, 'ReferencedFileID'):
+                    # ReferencedFileID can be a list of path components
+                    file_id_components = record.ReferencedFileID
+                    if isinstance(file_id_components, (list, tuple, pydicom.multival.MultiValue)):
+                        # Join path components with appropriate separator
+                        relative_path = Path(*file_id_components)
+                    else:
+                        # Single component
+                        relative_path = Path(file_id_components)
+                    
+                    # Convert to absolute path relative to DICOMDIR location
+                    absolute_path = dicomdir_root / relative_path
+                    
+                    if absolute_path.exists():
+                        referenced_files.append(absolute_path)
+                        _LOGGER.debug(f"Found referenced DICOM file: {absolute_path}")
+                    else:
+                        _LOGGER.warning(f"Referenced file not found: {absolute_path}")
+        
+        _LOGGER.info(f"DICOMDIR parsing found {len(referenced_files)} referenced files")
+        return referenced_files
+        
+    except Exception as e:
+        _LOGGER.error(f"Error parsing DICOMDIR file {dicomdir_path}: {e}")
+        raise
