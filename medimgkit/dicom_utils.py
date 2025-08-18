@@ -1,6 +1,7 @@
 from pydicom.pixels import pixel_array
 import pydicom
 import pydicom.dataset
+import pydicom.datadict
 from pydicom.uid import generate_uid
 from typing import Sequence, Generator, IO, TypeVar, Generic
 import warnings
@@ -79,7 +80,7 @@ _TOKEN_MAPPER = TokenMapper()
 def anonymize_dicom(ds: pydicom.Dataset,
                     retain_codes: Sequence[tuple] = [],
                     copy=False,
-                    token_mapper: TokenMapper = None) -> pydicom.Dataset:
+                    token_mapper: TokenMapper | None= None) -> pydicom.Dataset:
     """
     Anonymize a DICOM file by clearing all the specified DICOM tags
     according to the DICOM standard https://www.dicomstandard.org/News-dir/ftsup/docs/sups/sup55.pdf.
