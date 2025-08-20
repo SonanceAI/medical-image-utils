@@ -8,7 +8,7 @@ from pydicom.uid import generate_uid
 import pydicom.uid
 import pydicom.multival
 from pydicom.misc import is_dicom as pydicom_is_dicom
-from typing import Sequence, Generator, IO, TypeVar, Generic
+from typing import Sequence, Generator, IO, TypeVar, Generic, Literal
 import warnings
 from copy import deepcopy
 import logging
@@ -921,25 +921,35 @@ def parse_dicomdir_files(dicomdir_path: Path) -> list[Path]:
         raise
 
 
-def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | list[str] | list[Path],
-                                          plane_size: float = 50,
-                                          slice_tags_on_tooltip:list[str] = []):
+def create_3d_dicom_viewer(dicom_list: list[pydicom.Dataset] | list[str] | list[Path],
+                           plane_size: float = 50,
+                           slice_tags_on_tooltip: list[str] = [],
+                           size_method: Literal['real', 'pixel_spacing', 'constant'] = 'real',
+                           opacity: float = 0.25):
     import plotly.graph_objects as go
     import plotly.express as px
     """
     Create an enhanced 3D visualization with actual image planes and orientation vectors.
 
     Args:
-        splitted_dicoms: List of DICOM datasets
-        plane_size: Size of the plane visualization in mm
+        dicom_list: List of DICOM datasets, file paths, or Path objects
+        plane_size: Size of the plane visualization in mm (used when size_method='constant' or 'pixel_spacing')
         slice_tags_on_tooltip: List of DICOM tag paths to show in tooltip. 
                                Use '.' to separate nested tags (e.g., 'RelatedSeriesSequence.ReferencedImageSequence')
+        size_method: Method for determining plane size:
+                    - 'real': Use actual DICOM image dimensions and pixel spacing
+                    - 'pixel_spacing': Apply pixel spacing scaling to plane_size
+                    - 'constant': Use fixed plane_size for all planes
+        opacity: Opacity of the plane meshes (0.0 = fully transparent, 1.0 = fully opaque)
     """
 
-    slice_tags_on_tooltip = list(slice_tags_on_tooltip) # copy to avoid mutation
+    # validate parameters
+    if size_method not in ['real', 'pixel_spacing', 'constant']:
+        raise ValueError("Invalid size_method. Choose from 'real', 'pixel_spacing', or 'constant'.")
+
+    slice_tags_on_tooltip = list(slice_tags_on_tooltip)  # copy to avoid mutation
     slice_tags_on_tooltip = [tag.replace(' ', '') for tag in slice_tags_on_tooltip]
-    
-    
+
     def get_nested_tag_value(ds: pydicom.Dataset, tag_path: list[str]):
         """Extract nested tag value from DICOM dataset using dot-separated path."""
         try:
@@ -954,10 +964,15 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
             return current
         except (AttributeError, IndexError, TypeError):
             return None
-    
+
     # Ensure all datasets are DICOM objects
     tags_to_read = set(['ImagePositionPatient', 'PatientPosition', 'SeriesDescription',
-                    'ImageOrientationPatient', 'SeriesInstanceUID', 'InstanceNumber'])
+                        'ImageOrientationPatient', 'SeriesInstanceUID', 'InstanceNumber'])
+
+    # Add tags needed for real size calculation
+    if size_method in ['real', 'pixel_spacing']:
+        tags_to_read.update(['PixelSpacing', 'Rows', 'Columns'])
+
     specific_tags_read = tags_to_read.copy()
     tags_to_read.update(slice_tags_on_tooltip)  # Add nested tags to read
     tags_to_read = [tag.split('.') for tag in tags_to_read]  # Convert to list of lists
@@ -972,6 +987,14 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         data['x_orientation'].append(ds.ImageOrientationPatient[0:3])
         data['y_orientation'].append(ds.ImageOrientationPatient[3:6])
         data['slice_orientation'].append(np.cross(ds.ImageOrientationPatient[0:3], ds.ImageOrientationPatient[3:6]))
+
+        # Add real size data if requested
+        if size_method in ['real', 'pixel_spacing']:
+            pixel_spacing = getattr(ds, 'PixelSpacing', [1.0, 1.0])
+            data['pixel_spacing'].append(pixel_spacing)
+            data['rows'].append(getattr(ds, 'Rows', 512))
+            data['columns'].append(getattr(ds, 'Columns', 512))
+
         for tag_path in tags_to_read:
             tag_key = '.'.join(tag_path)
             data[tag_key].append(get_nested_tag_value(ds, tag_path))
@@ -1009,7 +1032,13 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
     ))
 
     # Vector length for orientation visualization
-    vector_length = plane_size * 0.3
+    if size_method == 'real':
+        # Use average of real dimensions for vector length
+        avg_real_width = np.mean([row['pixel_spacing'][0] * row['columns'] for _, row in df.iterrows()])
+        avg_real_height = np.mean([row['pixel_spacing'][1] * row['rows'] for _, row in df.iterrows()])
+        vector_length = min(avg_real_width, avg_real_height) * 0.3
+    else:
+        vector_length = plane_size * 0.3
 
     # Add image planes and orientation vectors
     for i, row in df.iterrows():
@@ -1017,27 +1046,54 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         x_orient = row['x_orientation']
         y_orient = row['y_orientation']
         slice_norm = row['slice_orientation']
-        
+
         # Normalize orientations
         x_unit = x_orient / np.linalg.norm(x_orient)
         y_unit = y_orient / np.linalg.norm(y_orient)
         slice_unit = slice_norm / np.linalg.norm(slice_norm)
 
+        # Calculate plane dimensions based on size_method
+        if size_method == 'real':
+            # Use actual image dimensions with pixel spacing
+            pixel_spacing = row['pixel_spacing']
+            real_width = pixel_spacing[0] * row['columns']  # mm
+            real_height = pixel_spacing[1] * row['rows']    # mm
+            half_width = real_width / 2
+            half_height = real_height / 2
+        elif size_method == 'pixel_spacing':
+            # Use pixel spacing but keep plane_size as reference
+            pixel_spacing = row['pixel_spacing']
+            avg_spacing = (pixel_spacing[0] + pixel_spacing[1]) / 2
+            scaled_size = plane_size * avg_spacing
+            half_width = half_height = scaled_size / 2
+        else:  # size_method == 'constant'
+            # Use fixed plane_size
+            half_width = half_height = plane_size / 2
+
         # Create plane corners
-        half_size = plane_size / 2
         corners = np.array([
-            pos - half_size * x_unit - half_size * y_unit,  # bottom-left
-            pos + half_size * x_unit - half_size * y_unit,  # bottom-right
-            pos + half_size * x_unit + half_size * y_unit,  # top-right
-            pos - half_size * x_unit + half_size * y_unit,  # top-left
+            pos - half_width * x_unit - half_height * y_unit,  # bottom-left
+            pos + half_width * x_unit - half_height * y_unit,  # bottom-right
+            pos + half_width * x_unit + half_height * y_unit,  # top-right
+            pos - half_width * x_unit + half_height * y_unit,  # top-left
         ])
 
         # Use series index for consistent coloring
         series_idx = series_color_map[row['SeriesInstanceUID']]
         plane_color = px.colors.qualitative.Set1[series_idx % len(px.colors.qualitative.Set1)]
         hovertemplate = f"<b>Slice {int(row['InstanceNumber'])}</b><br>" + \
-                        f"Series: {row['SeriesDescription']}<br>" + \
-                        f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})<br>"
+            f"Series: {row['SeriesDescription']}<br>" + \
+            f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})<br>"
+
+        # Add real size info to tooltip if available
+        if size_method == 'real':
+            hovertemplate += f"Real Size: {real_width:.1f} x {real_height:.1f} mm<br>" + \
+                f"Pixel Spacing: {pixel_spacing[0]:.2f} x {pixel_spacing[1]:.2f} mm<br>" + \
+                f"Matrix: {row['columns']} x {row['rows']}<br>"
+        elif size_method == 'pixel_spacing':
+            pixel_spacing = row['pixel_spacing']
+            hovertemplate += f"Pixel Spacing: {pixel_spacing[0]:.2f} x {pixel_spacing[1]:.2f} mm<br>"
+
         for tag_path in splitted_slice_tags_on_tooltip:
             tag_key = '.'.join(tag_path)
             tag_value = row.get(tag_key, 'N/A')
@@ -1048,7 +1104,7 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         fig.add_trace(go.Mesh3d(
             x=corners[:, 0], y=corners[:, 1], z=corners[:, 2],
             i=[0, 0], j=[1, 2], k=[2, 3],
-            opacity=0.3, color=plane_color,
+            opacity=opacity, color=plane_color,
             name=f'Series {series_idx} - Slice {int(row["InstanceNumber"])}',
             showlegend=False,
             hovertemplate=hovertemplate
@@ -1060,7 +1116,7 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
             (y_unit, 'green', 'Y-orientation'),
             (slice_unit, 'blue', 'Slice Normal')
         ]
-        
+
         for unit_vec, color, label in vectors:
             end_pos = pos + vector_length * unit_vec
             fig.add_trace(go.Scatter3d(
@@ -1080,7 +1136,7 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         ([0, 0], [0, axis_length], [0, 0], 'green', 'Y-axis (Global)'),
         ([0, 0], [0, 0], [0, axis_length], 'blue', 'Z-axis (Global)')
     ]
-    
+
     for x, y, z, color, name in axes:
         fig.add_trace(go.Scatter3d(
             x=x, y=y, z=z, mode='lines',
@@ -1089,8 +1145,14 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         ))
 
     # Update layout
+    title_suffix = ""
+    if size_method == 'real':
+        title_suffix = " - Real Size Planes"
+    elif size_method == 'pixel_spacing':
+        title_suffix = " - Pixel Spacing Applied"
+
     fig.update_layout(
-        title="Enhanced 3D DICOM Visualization with Image Planes and Orientation Vectors<br>" +
+        title="Enhanced 3D DICOM Visualization with Image Planes and Orientation Vectors" + title_suffix + "<br>" +
               "<sub>Colored by Series - Semi-transparent planes with orientation vectors (Red=X, Green=Y, Blue=Normal)</sub>",
         scene=dict(
             xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
