@@ -922,7 +922,8 @@ def parse_dicomdir_files(dicomdir_path: Path) -> list[Path]:
 
 
 def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | list[str] | list[Path],
-                                          plane_size: float = 50):
+                                          plane_size: float = 50,
+                                          slice_tags_on_tooltip:list[str] = []):
     import plotly.graph_objects as go
     import plotly.express as px
     """
@@ -933,22 +934,24 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         plane_size: Size of the plane visualization in mm
     """
 
+    slice_tags_on_tooltip = list(slice_tags_on_tooltip) # copy to avoid mutation
     # Ensure all datasets are DICOM objects
-    tags_to_read = ['ImagePositionPatient', 'PatientPosition', 'SeriesDescription',
-                    'ImageOrientationPatient', 'SeriesInstanceUID', 'InstanceNumber']
-    splitted_dicoms = [dcmread(ds, specific_tags=tags_to_read) if isinstance(ds, (str, Path)) else ds
+    tags_to_read = set(['ImagePositionPatient', 'PatientPosition', 'SeriesDescription',
+                    'ImageOrientationPatient', 'SeriesInstanceUID', 'InstanceNumber'])
+    tags_to_read.update(slice_tags_on_tooltip)
+
+    splitted_dicoms = [dcmread(ds, specific_tags=list(tags_to_read)) if isinstance(ds, (str, Path)) else ds
                        for ds in dicom_list]
 
-    df = pd.DataFrame([{'ImagePositionPatient': ds.ImagePositionPatient,
-                        'PatientPosition': ds.PatientPosition,
-                        'x_orientation': ds.ImageOrientationPatient[0:3],
-                        'y_orientation': ds.ImageOrientationPatient[3:6],
-                        'slice_orientation': np.cross(ds.ImageOrientationPatient[0:3], ds.ImageOrientationPatient[3:6]),
-                        'SeriesInstanceUID': ds.SeriesInstanceUID,
-                        'SeriesDescription': ds.SeriesDescription,
-                        'InstanceNumber': ds.InstanceNumber
-                        }
-                       for ds in splitted_dicoms])
+    data = defaultdict(list)
+    for ds in splitted_dicoms:
+        data['x_orientation'].append(ds.ImageOrientationPatient[0:3])
+        data['y_orientation'].append(ds.ImageOrientationPatient[3:6])
+        data['slice_orientation'].append(np.cross(ds.ImageOrientationPatient[0:3], ds.ImageOrientationPatient[3:6]))
+        for tag in tags_to_read:
+            data[tag].append(ds.get(tag, None))
+
+    df = pd.DataFrame(data)
 
     fig = go.Figure()
     positions = np.array([pos for pos in df['ImagePositionPatient']])
@@ -1007,6 +1010,12 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         # Use series index for consistent coloring
         series_idx = series_color_map[row['SeriesInstanceUID']]
         plane_color = px.colors.qualitative.Set1[series_idx % len(px.colors.qualitative.Set1)]
+        hovertemplate = f"<b>Slice {int(row['InstanceNumber'])}</b><br>" + \
+                        f"Series: {row['SeriesDescription']}<br>" + \
+                        f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})<br>"
+        for tag in slice_tags_on_tooltip:
+            hovertemplate += f"{tag}: {row[tag]}<br>"
+        hovertemplate += "<extra></extra>"
 
         # Create plane mesh
         fig.add_trace(go.Mesh3d(
@@ -1015,10 +1024,7 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
             opacity=0.3, color=plane_color,
             name=f'Series {series_idx} - Slice {int(row["InstanceNumber"])}',
             showlegend=False,
-            hovertemplate=f"<b>Slice {int(row['InstanceNumber'])}</b><br>" +
-            f"Series: {row['SeriesDescription']}<br>" +
-            f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})<br>" +
-            "<extra></extra>"
+            hovertemplate=hovertemplate
         ))
 
         # Add orientation vectors
