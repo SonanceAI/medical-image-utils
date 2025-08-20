@@ -1,3 +1,5 @@
+import pandas as pd
+from pydicom import dcmread
 from pydicom.pixels import pixel_array
 import pydicom
 import pydicom.dataset
@@ -5,19 +7,18 @@ import pydicom.datadict
 from pydicom.uid import generate_uid
 import pydicom.uid
 import pydicom.multival
+from pydicom.misc import is_dicom as pydicom_is_dicom
 from typing import Sequence, Generator, IO, TypeVar, Generic
 import warnings
 from copy import deepcopy
 import logging
 from pathlib import Path
-from pydicom.misc import is_dicom as pydicom_is_dicom
 from io import BytesIO
 import os
 import numpy as np
 from collections import defaultdict
 import uuid
 import hashlib
-from tqdm import tqdm
 from .io_utils import peek, is_io_object
 
 _LOGGER = logging.getLogger(__name__)
@@ -255,6 +256,7 @@ def assemble_dicoms(files_path: list[str | IO],
     Returns:
         A generator that yields the merged DICOM files.
     """
+    from tqdm.auto import tqdm
     dicoms_map = defaultdict(list)
 
     for file_path in tqdm(files_path, desc="Reading DICOMs metadata", unit="file"):
@@ -917,3 +919,159 @@ def parse_dicomdir_files(dicomdir_path: Path) -> list[Path]:
     except Exception as e:
         _LOGGER.error(f"Error parsing DICOMDIR file {dicomdir_path}: {e}")
         raise
+
+
+def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | list[str] | list[Path],
+                                          plane_size: float = 50):
+    import plotly.graph_objects as go
+    import plotly.express as px
+    """
+    Create an enhanced 3D visualization with actual image planes and orientation vectors.
+
+    Args:
+        splitted_dicoms: List of DICOM datasets
+        plane_size: Size of the plane visualization in mm
+    """
+
+    # Ensure all datasets are DICOM objects
+    tags_to_read = ['ImagePositionPatient', 'PatientPosition', 'SeriesDescription',
+                    'ImageOrientationPatient', 'SeriesInstanceUID', 'InstanceNumber']
+    splitted_dicoms = [dcmread(ds, specific_tags=tags_to_read) if isinstance(ds, (str, Path)) else ds
+                       for ds in dicom_list]
+
+    df = pd.DataFrame([{'ImagePositionPatient': ds.ImagePositionPatient,
+                        'PatientPosition': ds.PatientPosition,
+                        'x_orientation': ds.ImageOrientationPatient[0:3],
+                        'y_orientation': ds.ImageOrientationPatient[3:6],
+                        'slice_orientation': np.cross(ds.ImageOrientationPatient[0:3], ds.ImageOrientationPatient[3:6]),
+                        'SeriesInstanceUID': ds.SeriesInstanceUID,
+                        'SeriesDescription': ds.SeriesDescription,
+                        'InstanceNumber': ds.InstanceNumber
+                        }
+                       for ds in splitted_dicoms])
+
+    fig = go.Figure()
+    positions = np.array([pos for pos in df['ImagePositionPatient']])
+
+    # Get unique SeriesUIDs and create color mapping
+    unique_series = df['SeriesInstanceUID'].unique()
+    series_color_map = {series: i for i, series in enumerate(unique_series)}
+    series_colors = [series_color_map[series] for series in df['SeriesInstanceUID']]
+
+    # Add slice positions
+    fig.add_trace(go.Scatter3d(
+        x=positions[:, 0],
+        y=positions[:, 1],
+        z=positions[:, 2],
+        mode='markers+text',
+        marker=dict(
+            size=6,
+            color=series_colors,
+            colorscale='Plasma',
+            showscale=True,
+            colorbar=dict(title="Series Index", x=1.02)
+        ),
+        text=[f"{int(inst)}" for inst in df['InstanceNumber']],
+        textposition="middle center",
+        name="Slice Centers",
+        hovertemplate="<b>Instance %{text}</b><br>" +
+                      "Position: (%{x:.1f}, %{y:.1f}, %{z:.1f})<br>" +
+                      "Series: " + df['SeriesDescription'].astype(str) + "<br>" +
+                      "<extra></extra>"
+    ))
+
+    # Vector length for orientation visualization
+    vector_length = plane_size * 0.3
+
+    # Add image planes and orientation vectors
+    for i, row in df.iterrows():
+        pos = row['ImagePositionPatient']
+        x_orient = row['x_orientation']
+        y_orient = row['y_orientation']
+        slice_norm = row['slice_orientation']
+        
+        # Normalize orientations
+        x_unit = x_orient / np.linalg.norm(x_orient)
+        y_unit = y_orient / np.linalg.norm(y_orient)
+        slice_unit = slice_norm / np.linalg.norm(slice_norm)
+
+        # Create plane corners
+        half_size = plane_size / 2
+        corners = np.array([
+            pos - half_size * x_unit - half_size * y_unit,  # bottom-left
+            pos + half_size * x_unit - half_size * y_unit,  # bottom-right
+            pos + half_size * x_unit + half_size * y_unit,  # top-right
+            pos - half_size * x_unit + half_size * y_unit,  # top-left
+        ])
+
+        # Use series index for consistent coloring
+        series_idx = series_color_map[row['SeriesInstanceUID']]
+        plane_color = px.colors.qualitative.Set1[series_idx % len(px.colors.qualitative.Set1)]
+
+        # Create plane mesh
+        fig.add_trace(go.Mesh3d(
+            x=corners[:, 0], y=corners[:, 1], z=corners[:, 2],
+            i=[0, 0], j=[1, 2], k=[2, 3],
+            opacity=0.3, color=plane_color,
+            name=f'Series {series_idx} - Slice {int(row["InstanceNumber"])}',
+            showlegend=False,
+            hovertemplate=f"<b>Slice {int(row['InstanceNumber'])}</b><br>" +
+            f"Series: {row['SeriesDescription']}<br>" +
+            f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})<br>" +
+            "<extra></extra>"
+        ))
+
+        # Add orientation vectors
+        vectors = [
+            (x_unit, 'red', 'X-orientation'),
+            (y_unit, 'green', 'Y-orientation'),
+            (slice_unit, 'blue', 'Slice Normal')
+        ]
+        
+        for unit_vec, color, label in vectors:
+            end_pos = pos + vector_length * unit_vec
+            fig.add_trace(go.Scatter3d(
+                x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]], z=[pos[2], end_pos[2]],
+                mode='lines', line=dict(color=color, width=3),
+                name=f'{label} {i}', showlegend=False,
+                hovertemplate=f"<b>{label}</b><br>" +
+                f"Slice {int(row['InstanceNumber'])}<br>" +
+                f"Vector: ({unit_vec[0]:.3f}, {unit_vec[1]:.3f}, {unit_vec[2]:.3f})<br>" +
+                "<extra></extra>"
+            ))
+
+    # Add coordinate system at origin
+    axis_length = 30
+    axes = [
+        ([0, axis_length], [0, 0], [0, 0], 'red', 'X-axis (Global)'),
+        ([0, 0], [0, axis_length], [0, 0], 'green', 'Y-axis (Global)'),
+        ([0, 0], [0, 0], [0, axis_length], 'blue', 'Z-axis (Global)')
+    ]
+    
+    for x, y, z, color, name in axes:
+        fig.add_trace(go.Scatter3d(
+            x=x, y=y, z=z, mode='lines',
+            line=dict(color=color, width=6),
+            name=name, hoverinfo='skip'
+        ))
+
+    # Update layout
+    fig.update_layout(
+        title="Enhanced 3D DICOM Visualization with Image Planes and Orientation Vectors<br>" +
+              "<sub>Colored by Series - Semi-transparent planes with orientation vectors (Red=X, Green=Y, Blue=Normal)</sub>",
+        scene=dict(
+            xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
+            aspectmode='data',
+            camera=dict(
+                up=dict(x=0, y=0, z=1),
+                center=dict(x=0, y=0, z=0),
+                eye=dict(x=1.8, y=1.8, z=1.5)
+            ),
+            bgcolor='rgba(0,0,0,0.05)'
+        ),
+        width=1000,
+        height=800,
+        margin=dict(l=0, r=100, t=80, b=0)
+    )
+
+    return fig
