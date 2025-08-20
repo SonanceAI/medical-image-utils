@@ -932,15 +932,39 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
     Args:
         splitted_dicoms: List of DICOM datasets
         plane_size: Size of the plane visualization in mm
+        slice_tags_on_tooltip: List of DICOM tag paths to show in tooltip. 
+                               Use '.' to separate nested tags (e.g., 'RelatedSeriesSequence.ReferencedImageSequence')
     """
 
     slice_tags_on_tooltip = list(slice_tags_on_tooltip) # copy to avoid mutation
+    slice_tags_on_tooltip = [tag.replace(' ', '') for tag in slice_tags_on_tooltip]
+    
+    
+    def get_nested_tag_value(ds: pydicom.Dataset, tag_path: list[str]):
+        """Extract nested tag value from DICOM dataset using dot-separated path."""
+        try:
+            current = ds
+            for i, tag in enumerate(tag_path):
+                if not hasattr(current, tag):
+                    return None
+                current = getattr(current, tag)
+                # If this is a sequence and not the last element, take the first item
+                if i < len(tag_path) - 1 and hasattr(current, '__iter__') and len(current) > 0:
+                    current = current[0]
+            return current
+        except (AttributeError, IndexError, TypeError):
+            return None
+    
     # Ensure all datasets are DICOM objects
     tags_to_read = set(['ImagePositionPatient', 'PatientPosition', 'SeriesDescription',
                     'ImageOrientationPatient', 'SeriesInstanceUID', 'InstanceNumber'])
-    tags_to_read.update(slice_tags_on_tooltip)
+    specific_tags_read = tags_to_read.copy()
+    tags_to_read.update(slice_tags_on_tooltip)  # Add nested tags to read
+    tags_to_read = [tag.split('.') for tag in tags_to_read]  # Convert to list of lists
 
-    splitted_dicoms = [dcmread(ds, specific_tags=list(tags_to_read)) if isinstance(ds, (str, Path)) else ds
+    splitted_slice_tags_on_tooltip = [tag.split('.') for tag in slice_tags_on_tooltip]
+    specific_tags_read.update([tag[0] for tag in splitted_slice_tags_on_tooltip])
+    splitted_dicoms = [dcmread(ds, specific_tags=list(specific_tags_read)) if isinstance(ds, (str, Path)) else ds
                        for ds in dicom_list]
 
     data = defaultdict(list)
@@ -948,8 +972,9 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         data['x_orientation'].append(ds.ImageOrientationPatient[0:3])
         data['y_orientation'].append(ds.ImageOrientationPatient[3:6])
         data['slice_orientation'].append(np.cross(ds.ImageOrientationPatient[0:3], ds.ImageOrientationPatient[3:6]))
-        for tag in tags_to_read:
-            data[tag].append(ds.get(tag, None))
+        for tag_path in tags_to_read:
+            tag_key = '.'.join(tag_path)
+            data[tag_key].append(get_nested_tag_value(ds, tag_path))
 
     df = pd.DataFrame(data)
 
@@ -1013,8 +1038,10 @@ def create_enhanced_3d_viewer_with_planes(dicom_list: list[pydicom.Dataset] | li
         hovertemplate = f"<b>Slice {int(row['InstanceNumber'])}</b><br>" + \
                         f"Series: {row['SeriesDescription']}<br>" + \
                         f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})<br>"
-        for tag in slice_tags_on_tooltip:
-            hovertemplate += f"{tag}: {row[tag]}<br>"
+        for tag_path in splitted_slice_tags_on_tooltip:
+            tag_key = '.'.join(tag_path)
+            tag_value = row.get(tag_key, 'N/A')
+            hovertemplate += f"{tag_key}: {tag_value}<br>"
         hovertemplate += "<extra></extra>"
 
         # Create plane mesh
