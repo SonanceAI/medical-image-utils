@@ -34,7 +34,9 @@ dependencies = [
     'puremagic>=1.30',
     'plotly>=5.19.0',
     'nbformat>=4.3.0',
-    'pandas>=1.5.3'
+    'pandas>=1.5.3',
+    'pylibjpeg>=2.0.0',
+    'pylibjpeg-libjpeg>=2.0.0'
 ]
 
 [project.optional-dependencies]

@@ -244,63 +244,99 @@ def load_image_normalized(dicom: pydicom.Dataset, index: int = None) -> np.ndarr
     raise ValueError(f"Unsupported DICOM normalization with shape: {shape}, SamplesPerPixel: {c}, NumberOfFrames: {n}")
 
 
-def assemble_dicoms(files_path: list[str | IO],
-                    return_as_IO: bool = False) -> GeneratorWithLength[pydicom.Dataset | IO]:
+def _validate_dicoms_for_assembling(dicom_list: list[tuple]) -> None:
+    if len(dicom_list) <= 1:
+        return
+    # Get dimensions from first DICOM
+    first_rows = dicom_list[0][2]
+    first_columns = dicom_list[0][3]
+
+    # Check all other DICOMs have the same dimensions
+    for instance_number, file_path, rows, columns in dicom_list:
+        if rows != first_rows or columns != first_columns:
+            msg = (
+                f"Dimension mismatch: "
+                f"Expected {first_rows}x{first_columns}, got {rows}x{columns} "
+                f"for file {file_path} and {dicom_list[0][1]}"
+            )
+            _LOGGER.error(msg)
+            raise ValueError(msg)
+
+
+def assemble_dicoms(files_path: list[str] | list[IO],
+                    return_as_IO: bool = False,
+                    groupby_tags: list[str] = ['SeriesInstanceUID',
+                                               'StudyInstanceUID',
+                                               'Modality',
+                                               'ImageOrientationPatient',
+                                               'Laterality',
+                                               'ImageLaterality',
+                                               'FrameLaterality',
+                                               'ScanningSequence',
+                                               'Rows',
+                                               'Columns'
+                                               ],
+                    ) -> GeneratorWithLength[pydicom.Dataset | IO]:
     """
     Assemble multiple DICOM files into a single multi-frame DICOM file.
     This function will merge the pixel data of the DICOM files and generate a new DICOM file with the combined pixel data.
 
     Args:
         files_path: A list of file paths to the DICOM files to be merged.
+        return_as_IO: If True, return BytesIO objects instead of Dataset objects.
+        groupby_tags: List of DICOM tag names to group by. If None, uses default grouping tags.
 
     Returns:
         A generator that yields the merged DICOM files.
     """
     from tqdm.auto import tqdm
+
     dicoms_map = defaultdict(list)
+
+    # Extend specific_tags to include all groupby_tags
+    specific_tags = ['InstanceNumber', 'Rows', 'Columns'] + groupby_tags
 
     for file_path in tqdm(files_path, desc="Reading DICOMs metadata", unit="file"):
         if is_io_object(file_path):
             with peek(file_path):
                 dicom = pydicom.dcmread(file_path,
-                                        specific_tags=['SeriesInstanceUID', 'InstanceNumber', 'Rows', 'Columns'],
+                                        specific_tags=specific_tags,
                                         stop_before_pixels=True)
         else:
             dicom = pydicom.dcmread(file_path,
-                                    specific_tags=['SeriesInstanceUID', 'InstanceNumber', 'Rows', 'Columns'],
+                                    specific_tags=specific_tags,
                                     stop_before_pixels=True)
-        series_uid = dicom.get('SeriesInstanceUID', None)
-        if series_uid is None:
-            # generate a random uid
-            series_uid = pydicom.uid.generate_uid()
+
+        # Create a composite key from all groupby_tags
+        group_key_parts = []
+        for tag_name in groupby_tags:
+            tag_value = dicom.get(tag_name, None)
+
+            # Handle special cases for certain tags
+            if tag_name == 'ImageOrientationPatient' and tag_value is not None:
+                # Round orientation values to avoid minor floating point differences
+                tag_value = tuple(round(float(v), 6) for v in tag_value)
+            elif isinstance(tag_value, float):
+                # Round floating point values to avoid precision issues
+                tag_value = round(tag_value, 6)
+
+            group_key_parts.append((tag_name, tag_value))
+
+        # Create a hashable composite key
+        composite_key = tuple(group_key_parts)
+
         instance_number = dicom.get('InstanceNumber', 0)
         rows = dicom.get('Rows', None)
         columns = dicom.get('Columns', None)
-        dicoms_map[series_uid].append((instance_number, file_path, rows, columns))
+        dicoms_map[composite_key].append((instance_number, file_path, rows, columns))
 
-    # Validate that all DICOMs with the same SeriesInstanceUID have matching dimensions
-    for series_uid, dicom_list in dicoms_map.items():
-        if len(dicom_list) <= 1:
-            continue
-
-        # Get dimensions from first DICOM
-        first_rows = dicom_list[0][2]
-        first_columns = dicom_list[0][3]
-
-        # Check all other DICOMs have the same dimensions
-        for instance_number, file_path, rows, columns in dicom_list:
-            if rows != first_rows or columns != first_columns:
-                msg = (
-                    f"Dimension mismatch in SeriesInstanceUID {series_uid}: "
-                    f"Expected {first_rows}x{first_columns}, got {rows}x{columns} "
-                    f"for file {file_path} and {dicom_list[0][1]}"
-                )
-                _LOGGER.error(msg)
-                raise ValueError(msg)
+    # Validate that all DICOMs with the same composite key have matching dimensions
+    for composite_key, dicom_list in dicoms_map.items():
+        _validate_dicoms_for_assembling(dicom_list)
 
     # filter out the two last elements of the tuple (rows, columns)
-    dicoms_map = {fr_uid: [(instance_number, file_path) for instance_number, file_path, _, _ in dicoms]
-                  for fr_uid, dicoms in dicoms_map.items()}
+    dicoms_map = {composite_key: [(instance_number, file_path) for instance_number, file_path, _, _ in dicoms]
+                  for composite_key, dicoms in dicoms_map.items()}
 
     gen = _generate_merged_dicoms(dicoms_map, return_as_IO=return_as_IO)
     return GeneratorWithLength(gen, len(dicoms_map))
