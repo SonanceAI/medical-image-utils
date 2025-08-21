@@ -263,6 +263,7 @@ def _validate_dicoms_for_assembling(dicom_list: list[tuple]) -> None:
             raise ValueError(msg)
 
 
+
 def assemble_dicoms(files_path: list[str] | list[IO],
                     return_as_IO: bool = False,
                     groupby_tags: list[str] = ['SeriesInstanceUID',
@@ -979,6 +980,8 @@ def create_3d_dicom_viewer(dicom_list: list[pydicom.Dataset] | list[str] | list[
         opacity: Opacity of the plane meshes (0.0 = fully transparent, 1.0 = fully opaque)
     """
 
+    # ImagePositionPatient: The x, y, and z coordinates of the upper left hand corner (center of the first voxel transmitted) of the image, in mm.
+
     # validate parameters
     if size_method not in ['real', 'pixel_spacing', 'constant']:
         raise ValueError("Invalid size_method. Choose from 'real', 'pixel_spacing', or 'constant'.")
@@ -1094,25 +1097,32 @@ def create_3d_dicom_viewer(dicom_list: list[pydicom.Dataset] | list[str] | list[
             pixel_spacing = row['pixel_spacing']
             real_width = pixel_spacing[0] * row['columns']  # mm
             real_height = pixel_spacing[1] * row['rows']    # mm
-            half_width = real_width / 2
-            half_height = real_height / 2
+            plane_width = real_width
+            plane_height = real_height
         elif size_method == 'pixel_spacing':
             # Use pixel spacing but keep plane_size as reference
             pixel_spacing = row['pixel_spacing']
             avg_spacing = (pixel_spacing[0] + pixel_spacing[1]) / 2
             scaled_size = plane_size * avg_spacing
-            half_width = half_height = scaled_size / 2
+            plane_width = plane_height = scaled_size
         else:  # size_method == 'constant'
             # Use fixed plane_size
-            half_width = half_height = plane_size / 2
+            plane_width = plane_height = plane_size
 
         # Create plane corners
+        # ImagePositionPatient is at the upper-left corner (center of the first voxel transmitted)
+        # We need to create corners relative to this position
+        # Row direction (x_unit) goes from left to right
+        # Column direction (y_unit) goes from top to bottom in image space
         corners = np.array([
-            pos - half_width * x_unit - half_height * y_unit,  # bottom-left
-            pos + half_width * x_unit - half_height * y_unit,  # bottom-right
-            pos + half_width * x_unit + half_height * y_unit,  # top-right
-            pos - half_width * x_unit + half_height * y_unit,  # top-left
+            pos,  # upper-left (ImagePositionPatient)
+            pos + plane_width * x_unit,  # upper-right
+            pos + plane_width * x_unit + plane_height * y_unit,  # lower-right  
+            pos + plane_height * y_unit,  # lower-left
         ])
+
+        # Calculate the center of the plane for orientation vectors
+        plane_center = pos + (plane_width / 2) * x_unit + (plane_height / 2) * y_unit
 
         # Use series index for consistent coloring
         series_idx = series_color_map[row['SeriesInstanceUID']]
@@ -1154,9 +1164,9 @@ def create_3d_dicom_viewer(dicom_list: list[pydicom.Dataset] | list[str] | list[
         ]
 
         for unit_vec, color, label in vectors:
-            end_pos = pos + vector_length * unit_vec
+            end_pos = plane_center + vector_length * unit_vec
             fig.add_trace(go.Scatter3d(
-                x=[pos[0], end_pos[0]], y=[pos[1], end_pos[1]], z=[pos[2], end_pos[2]],
+                x=[plane_center[0], end_pos[0]], y=[plane_center[1], end_pos[1]], z=[plane_center[2], end_pos[2]],
                 mode='lines', line=dict(color=color, width=3),
                 name=f'{label} {i}', showlegend=False,
                 hovertemplate=f"<b>{label}</b><br>" +
