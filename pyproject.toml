@@ -7,13 +7,12 @@ name = "medimgkit"
 version = "0.4.0"
 description = "A comprehensive toolkit for medical image processing, including DICOM, NIfTI, and multi-format I/O utilities"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Healthcare Industry",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -33,7 +32,7 @@ dependencies = [
     "tqdm>=4.60.0",
     "python-magic>=0.4.24",
     'puremagic>=1.30',
-    'plotpy>=5.19.0',
+    'plotly>=5.19.0',
     'nbformat>=4.3.0',
     'pandas>=1.5.3'
 ]
@@ -43,7 +42,6 @@ dev = [
     "pytest>=6.0",
     "pytest-cov",
     "flake8",
-    "pre-commit",
 ]
 test = [
     "pytest>=6.0",
@@ -59,6 +57,8 @@ Homepage = "https://github.com/SonanceAI/medimgkit"
 Repository = "https://github.com/SonanceAI/medimgkit"
 "Bug Tracker" = "https://github.com/SonanceAI/medimgkit/issues"
 
+[tool.setuptools]
+packages = ["medimgkit"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -71,7 +71,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["medimgkit"]
 omit = [
     "*/tests/*",
     "*/test_*",
