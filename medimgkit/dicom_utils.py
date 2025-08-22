@@ -104,7 +104,8 @@ def anonymize_dicom(ds: pydicom.Dataset,
 
     if token_mapper is None:
         token_mapper = _TOKEN_MAPPER
-
+    ### NOTE: If you want to include new tags values into uid_tags and/or simple_id_tags,
+    # ensure you add it to `tags_to_clear` and `uid_tags`.
     # https://www.dicomstandard.org/News-dir/ftsup/docs/sups/sup55.pdf
     tags_to_clear = [
         (0x0008, 0x0014), (0x0008, 0x0050), (0x0008, 0x0080), (0x0008, 0x0081), (0x0008, 0x0090),
@@ -121,8 +122,10 @@ def anonymize_dicom(ds: pydicom.Dataset,
 
     # Frame of Reference UID, Series Instance UID, Concatenation UID, and Instance UID, and StudyInstanceUID are converted to new UIDs
     uid_tags = [(0x0020, 0x0052), (0x0020, 0x000E), (0x0020, 0x9161),
-                (0x0010, 0x0020), (0x0008, 0x0018), (0x0020, 0x000D)]
-    simple_id_tags = [(0x0010, 0x0020)]  # Patient ID
+                (0x0010, 0x0020), (0x0008, 0x0018), (0x0020, 0x000D),
+                (0x0008, 0x0050)] # Must be in tags_to_clear too
+     # Patient ID and AccessionNumber
+    simple_id_tags = [(0x0010, 0x0020), (0x0008, 0x0050)] # must be in tags_to_clear and uid_tags too
 
     for code in retain_codes:
         if code in tags_to_clear:
@@ -494,7 +497,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                 continue
             # remove localizers
             sagittal_dicoms = [ds for ds in grouped_dicoms
-                            if determine_anatomical_plane_from_dicom(ds, alignment_threshold=0.93) == 'Sagittal']
+                               if determine_anatomical_plane_from_dicom(ds, alignment_threshold=0.93) == 'Sagittal']
             if len(sagittal_dicoms) == 0:
                 continue
             if all(get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
