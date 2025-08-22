@@ -433,7 +433,7 @@ def _find_localizers(dslist: Sequence[pydicom.Dataset]
     return localizers, non_localizers
 
 
-def _get_dicom_laterality(ds: pydicom.Dataset) -> str | None:
+def get_dicom_laterality(ds: pydicom.Dataset) -> str | None:
     lat = ds.get('ImageLaterality')
     if lat:
         return lat
@@ -497,14 +497,14 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                             if determine_anatomical_plane_from_dicom(ds, alignment_threshold=0.93) == 'Sagittal']
             if len(sagittal_dicoms) == 0:
                 continue
-            if all(_get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
+            if all(get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
                 # no need to infer laterality
                 continue
 
             try:
                 lateralities = list(_infer_laterality(sagittal_dicoms, localizers))
                 for i, ds in enumerate(sagittal_dicoms):
-                    written_lat = _get_dicom_laterality(ds)
+                    written_lat = get_dicom_laterality(ds)
                     if lateralities[i] is None or written_lat in ['L', 'R']:
                         lateralities[i] = written_lat
                     elif (written_lat is None or written_lat != 'B') and len(localizers) == 0:
@@ -617,6 +617,13 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
         components.append(ds.StudyDescription)
     elif hasattr(ds, 'StudyID'):
         components.append(ds.StudyID)
+
+    lat = get_dicom_laterality(ds)
+    if lat is not None:
+        if lat == 'L':
+            components.append("left")
+        elif lat == 'R':
+            components.append("right")
 
     # Join components and add extension
     if len(components) > 0:
