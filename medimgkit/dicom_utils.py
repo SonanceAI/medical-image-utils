@@ -456,6 +456,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                                                'Rows',
                                                'Columns'
                                                ],
+                    infer_laterality: bool = True
                     ) -> GeneratorWithLength[pydicom.Dataset | IO]:
     """
     Assemble multiple DICOM files into a single multi-frame DICOM file.
@@ -485,48 +486,49 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
             dicom = pydicom.dcmread(file_path)
         dicom_list.append(dicom)
 
-    ### infer laterality and update tag if necessary ###
-    localizers, non_localizers = _find_localizers(dicom_list)
-    dicoms_map = _group_dicoms_by_tags(dicom_list, ['FrameOfReferenceUID'])
-    for composite_key, grouped_dicoms in dicoms_map.items():
-        # if FrameOfReferenceUID is not valid, skip
-        if len(grouped_dicoms) == 0 or not grouped_dicoms[0].get('FrameOfReferenceUID'):
-            continue
-        # remove localizers
-        sagittal_dicoms = [ds for ds in grouped_dicoms
-                           if determine_anatomical_plane_from_dicom(ds, alignment_threshold=0.93) == 'Sagittal']
-        if len(sagittal_dicoms) == 0:
-            continue
-        if all(_get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
-            # no need to infer laterality
-            continue
+    if infer_laterality:
+        ### infer laterality and update tag if necessary ###
+        localizers, non_localizers = _find_localizers(dicom_list)
+        dicoms_map = _group_dicoms_by_tags(dicom_list, ['FrameOfReferenceUID'])
+        for composite_key, grouped_dicoms in dicoms_map.items():
+            # if FrameOfReferenceUID is not valid, skip
+            if len(grouped_dicoms) == 0 or not grouped_dicoms[0].get('FrameOfReferenceUID'):
+                continue
+            # remove localizers
+            sagittal_dicoms = [ds for ds in grouped_dicoms
+                            if determine_anatomical_plane_from_dicom(ds, alignment_threshold=0.93) == 'Sagittal']
+            if len(sagittal_dicoms) == 0:
+                continue
+            if all(_get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
+                # no need to infer laterality
+                continue
 
-        try:
-            lateralities = list(_infer_laterality(sagittal_dicoms, localizers))
-            for i, ds in enumerate(sagittal_dicoms):
-                written_lat = _get_dicom_laterality(ds)
-                if lateralities[i] is None or written_lat in ['L', 'R']:
-                    lateralities[i] = written_lat
-                elif (written_lat is None or written_lat != 'B') and len(localizers) == 0:
-                    # If no localizers are present and written is not 'B', we can't infer.
-                    lateralities[i] = None
-                if lateralities[i] is None:
-                    if 'ImageLaterality' in ds:
-                        del ds.ImageLaterality
-                else:
-                    ds.ImageLaterality = lateralities[i]
-                    if ds.get('FrameLaterality') in ['U', 'B']:
-                        ds.FrameLaterality = lateralities[i]
-                if 'Laterality' in ds:
-                    del ds.Laterality
-            # update laterality tag consistency
-            set_of_lateralities = set(lateralities)
-            if len(set_of_lateralities) == 1 and lateralities[0] is not None:
-                for ds in sagittal_dicoms:
-                    ds.Laterality = lateralities[0]
-        except Exception as e:
-            _LOGGER.warning(f"Error inferring laterality for {composite_key}: {e}")
-    ######
+            try:
+                lateralities = list(_infer_laterality(sagittal_dicoms, localizers))
+                for i, ds in enumerate(sagittal_dicoms):
+                    written_lat = _get_dicom_laterality(ds)
+                    if lateralities[i] is None or written_lat in ['L', 'R']:
+                        lateralities[i] = written_lat
+                    elif (written_lat is None or written_lat != 'B') and len(localizers) == 0:
+                        # If no localizers are present and written is not 'B', we can't infer.
+                        lateralities[i] = None
+                    if lateralities[i] is None:
+                        if 'ImageLaterality' in ds:
+                            del ds.ImageLaterality
+                    else:
+                        ds.ImageLaterality = lateralities[i]
+                        if ds.get('FrameLaterality') in ['U', 'B']:
+                            ds.FrameLaterality = lateralities[i]
+                    if 'Laterality' in ds:
+                        del ds.Laterality
+                # update laterality tag consistency
+                set_of_lateralities = set(lateralities)
+                if len(set_of_lateralities) == 1 and lateralities[0] is not None:
+                    for ds in sagittal_dicoms:
+                        ds.Laterality = lateralities[0]
+            except Exception as e:
+                _LOGGER.warning(f"Error inferring laterality for {composite_key}: {e}")
+        ######
 
     dicoms_map = _group_dicoms_by_tags(dicom_list, specific_tags)
 
