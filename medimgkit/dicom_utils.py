@@ -451,8 +451,6 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                                                'ImageOrientationPatient',
                                                'Laterality',
                                                'ImageLaterality',
-                                               'FrameLaterality',
-                                               'ScanningSequence',
                                                'Rows',
                                                'Columns'
                                                ],
@@ -530,7 +528,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                 _LOGGER.warning(f"Error inferring laterality for {composite_key}: {e}")
         ######
 
-    dicoms_map = _group_dicoms_by_tags(dicom_list, specific_tags)
+    dicoms_map = _group_dicoms_by_tags(dicom_list, groupby_tags)
 
     gen = _generate_merged_dicoms(dicoms_map, return_as_IO=return_as_IO)
     return GeneratorWithLength(gen, len(dicoms_map))
