@@ -912,20 +912,30 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
         str: The name of the anatomical plane ('Axial', 'Sagittal', 'Coronal', 'Oblique', or 'Unknown').
 
     Raises:
-        ValueError: If `slice_index` is not 0, 1, or 2.
+        ValueError: If `slice_axis` is not 0, 1, or 2.
     """
-
-    # check if is not a 2d image
-    if ds.get('NumberOfSlices', 1) != 1 and ds.get('NumberOfFrames', 1) != 1:
-        if slice_axis not in [0, 1, 2]:
-            raise ValueError("slice_index must be 0, 1 or 2")
+    # the first axis is the frame axis
+    if ds.get('NumberOfFrames', 1) != 1:
+        if slice_axis is None:
+            slice_axis = 0
+        elif ds.get('NumberOfSlices', 1) != 1: # check if is not a 2d image
+            if slice_axis not in [0, 1, 2]:
+                raise ValueError(f"slice_axis must be 0, 1 or 2, not {slice_axis}")
+        else:
+            slice_axis = 0
     else:
         slice_axis = 0
     # Check if Image Orientation Patient exists
-    if ds.get('ImageOrientationPatient') is None:
+    img_orient = get_image_orientation(ds, slice_index=0)
+    img_orient_last = get_image_orientation(ds, slice_index=-1)
+    # if not present or both are highly different
+    if img_orient is None or not np.allclose(img_orient, img_orient_last, atol=1e-3):
+        # ImageOrientationPatient is mandatory for some modalities
+        if ds.get('Modality') in ['MR', 'CT', 'PT', 'CR']:
+            _LOGGER.warning("ImageOrientationPatient not found in DICOM dataset.")
         return "Unknown"
     # Get the Image Orientation Patient (IOP) - 6 values defining row and column directions
-    iop = np.array(ds.ImageOrientationPatient, dtype=float)
+    iop = np.array(img_orient, dtype=float)
     if len(iop) != 6:
         return "Unknown"
     # Extract row and column direction vectors
