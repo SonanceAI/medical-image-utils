@@ -6,6 +6,7 @@ import pydicom.dataset
 import pydicom.datadict
 from pydicom.uid import generate_uid
 import pydicom.uid
+import pydicom.errors
 import pydicom.multival
 from pydicom.misc import is_dicom as pydicom_is_dicom
 from typing import Sequence, Generator, IO, TypeVar, Generic, Literal
@@ -104,7 +105,7 @@ def anonymize_dicom(ds: pydicom.Dataset,
 
     if token_mapper is None:
         token_mapper = _TOKEN_MAPPER
-    ### NOTE: If you want to include new tags values into uid_tags and/or simple_id_tags,
+    # NOTE: If you want to include new tags values into uid_tags and/or simple_id_tags,
     # ensure you add it to `tags_to_clear` and `uid_tags`.
     # https://www.dicomstandard.org/News-dir/ftsup/docs/sups/sup55.pdf
     tags_to_clear = [
@@ -123,9 +124,9 @@ def anonymize_dicom(ds: pydicom.Dataset,
     # Frame of Reference UID, Series Instance UID, Concatenation UID, and Instance UID, and StudyInstanceUID are converted to new UIDs
     uid_tags = [(0x0020, 0x0052), (0x0020, 0x000E), (0x0020, 0x9161),
                 (0x0010, 0x0020), (0x0008, 0x0018), (0x0020, 0x000D),
-                (0x0008, 0x0050)] # Must be in tags_to_clear too
-     # Patient ID and AccessionNumber
-    simple_id_tags = [(0x0010, 0x0020), (0x0008, 0x0050)] # must be in tags_to_clear and uid_tags too
+                (0x0008, 0x0050)]  # Must be in tags_to_clear too
+    # Patient ID and AccessionNumber
+    simple_id_tags = [(0x0010, 0x0020), (0x0008, 0x0050)]  # must be in tags_to_clear and uid_tags too
 
     for code in retain_codes:
         if code in tags_to_clear:
@@ -480,12 +481,25 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     dicom_list = []
 
     for file_path in tqdm(files_path, desc="Reading DICOMs metadata", unit="file"):
-        if is_io_object(file_path):
-            with peek(file_path):
+        try:
+            if is_io_object(file_path):
+                with peek(file_path):
+                    dicom = pydicom.dcmread(file_path)
+            else:
                 dicom = pydicom.dcmread(file_path)
-        else:
-            dicom = pydicom.dcmread(file_path)
-        dicom_list.append(dicom)
+            dicom_list.append(dicom)
+        except pydicom.errors.InvalidDicomError as e:
+            # Add file path to error message
+            if isinstance(file_path, str):
+                name = file_path
+            elif hasattr(file_path, 'name'):
+                name = file_path.name
+            else:
+                name = None
+            if name:
+                e.args = tuple(list(e.args) + [f"File: {name}"])
+            # raise it
+            raise
 
     if infer_laterality:
         ### infer laterality and update tag if necessary ###
@@ -497,7 +511,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                 continue
             # remove localizers
             sagittal_dicoms = [ds for ds in grouped_dicoms
-                               if determine_anatomical_plane_from_dicom(ds, alignment_threshold=0.93) == 'Sagittal']
+                               if determine_anatomical_plane_from_dicom(ds, alignment_threshold=15) == 'Sagittal']
             if len(sagittal_dicoms) == 0:
                 continue
             if all(get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
@@ -612,14 +626,16 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
 
     # if hasattr(ds, 'filename'):
     #     components.append(os.path.basename(ds.filename))
-    if hasattr(ds, 'SeriesDescription'):
+    if ds.get('SeriesDescription'):
         components.append(ds.SeriesDescription)
-    if len(components) == 0 and hasattr(ds, 'SeriesNumber'):
+    if len(components) == 0 and ds.get('SeriesNumber'):
         components.append(f"ser{ds.SeriesNumber}")
-    if hasattr(ds, 'StudyDescription'):
+    if ds.get('StudyDescription'):
         components.append(ds.StudyDescription)
-    elif hasattr(ds, 'StudyID'):
+    elif ds.get('StudyID'):
         components.append(ds.StudyID)
+    elif ds.get('StudyDate'):
+        components.append(ds.StudyDate)
 
     lat = get_dicom_laterality(ds)
     if lat is not None:
@@ -636,7 +652,7 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
         if len(description) > 0:
             return description
 
-    if hasattr(ds, 'SeriesInstanceUID'):
+    if ds.get('SeriesInstanceUID'):
         return ds.SeriesInstanceUID + ".dcm"
 
     # Fallback to generic name if no attributes found
@@ -646,7 +662,7 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
 def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
                             return_as_IO: bool = False) -> Generator[pydicom.Dataset, None, None]:
     for _, dicoms in dicoms_map.items():
-        dicoms.sort(key=lambda ds: ds.get('InstanceNumber', 0))
+        dicoms.sort(key=lambda ds: 0 if ds.get('InstanceNumber') is None else ds.get('InstanceNumber'))
         # Use the first dicom as a template
         merged_dicom = dicoms[0]
 
@@ -730,14 +746,14 @@ def get_image_orientation(ds: pydicom.Dataset, slice_index: int) -> np.ndarray:
         numpy.ndarray: Image orientation (X, Y, Z) for the specified slice.
     """
     # Get the Image Orientation Patient attribute
-    if 'ImageOrientationPatient' in ds:
+    if ds.get('ImageOrientationPatient') is not None:
         return ds.ImageOrientationPatient
 
-    if 'PerFrameFunctionalGroupsSequence' in ds:
+    if ds.get('PerFrameFunctionalGroupsSequence') is not None and len(ds.PerFrameFunctionalGroupsSequence) > 0:
         if 'PlaneOrientationSequence' in ds.PerFrameFunctionalGroupsSequence[slice_index]:
             return ds.PerFrameFunctionalGroupsSequence[slice_index].PlaneOrientationSequence[0].ImageOrientationPatient
 
-    if 'SharedFunctionalGroupsSequence' in ds:
+    if ds.get('SharedFunctionalGroupsSequence') is not None and len(ds.SharedFunctionalGroupsSequence) > 0:
         return ds.SharedFunctionalGroupsSequence[0].PlaneOrientationSequence[0].ImageOrientationPatient
 
     raise ValueError("ImageOrientationPatient not found in DICOM dataset.")
@@ -899,14 +915,15 @@ def pixel_to_patient(ds: pydicom.Dataset,
 
 def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
                                           slice_axis: int | None = None,
-                                          alignment_threshold: float = 0.95) -> str:
+                                          alignment_threshold: float = 15) -> str:
     """
     Determine the anatomical plane of a DICOM slice (Axial, Sagittal, Coronal, Oblique, or Unknown).
 
     Args:
         ds (pydicom.Dataset): The DICOM dataset containing the image metadata.
         slice_axis (int|None): The axis of the slice to analyze (0, 1, or 2). Unnecessary if is a 2d image.
-        alignment_threshold (float): Threshold for considering alignment with anatomical axes.
+        alignment_threshold (float): Threshold for considering alignment with anatomical axes in degrees.
+            Values above this threshold are considered "Oblique".
 
     Returns:
         str: The name of the anatomical plane ('Axial', 'Sagittal', 'Coronal', 'Oblique', or 'Unknown').
@@ -918,7 +935,7 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
     if ds.get('NumberOfFrames', 1) != 1:
         if slice_axis is None:
             slice_axis = 0
-        elif ds.get('NumberOfSlices', 1) != 1: # check if is not a 2d image
+        elif ds.get('NumberOfSlices', 1) != 1:  # check if is not a 2d image
             if slice_axis not in [0, 1, 2]:
                 raise ValueError(f"slice_axis must be 0, 1 or 2, not {slice_axis}")
         else:
@@ -926,13 +943,18 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
     else:
         slice_axis = 0
     # Check if Image Orientation Patient exists
-    img_orient = get_image_orientation(ds, slice_index=0)
-    img_orient_last = get_image_orientation(ds, slice_index=-1)
+    try:
+        img_orient = get_image_orientation(ds, slice_index=0)
+        img_orient_last = get_image_orientation(ds, slice_index=1 if ds.get('NumberOfFrames', 1) > 1 else 0)
+    except ValueError:
+        img_orient = None
+        img_orient_last = None
     # if not present or both are highly different
     if img_orient is None or not np.allclose(img_orient, img_orient_last, atol=1e-3):
         # ImageOrientationPatient is mandatory for some modalities
         if ds.get('Modality') in ['MR', 'CT', 'PT', 'CR']:
-            _LOGGER.warning("ImageOrientationPatient not found in DICOM dataset.")
+            _LOGGER.warning(
+                f"ImageOrientationPatient not found in DICOM dataset SOPInstanceUID={ds.get('SOPInstanceUID', '')}")
         return "Unknown"
     # Get the Image Orientation Patient (IOP) - 6 values defining row and column directions
     iop = np.array(img_orient, dtype=float)
@@ -963,13 +985,14 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
 
 
 def determine_anatomical_plane(axis_vector: np.ndarray,
-                               alignment_threshold: float = 0.95) -> tuple[str, float]:
+                               alignment_threshold: float = 15) -> tuple[str, float]:
     """
     Determine the anatomical plane based on the axis vector.
 
     Args:
         axis_vector (np.ndarray): The axis vector to analyze.
-        alignment_threshold (float): Threshold for considering alignment with anatomical axes.
+        alignment_threshold (float): Threshold for considering alignment with anatomical axes in degrees.
+            Values above this threshold are considered "Oblique".
 
     Returns:
         str: The name of the anatomical plane ('Axial', 'Sagittal', 'Coronal', 'Oblique', or 'Unknown').
@@ -980,25 +1003,27 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
 
     # Define standard anatomical axes
     # LPS coordinate system: L = Left(+), P = Posterior(+), S = Superior(+)
-    axes = {
-        'Sagittal': np.array([1, 0, 0]),   # L-R axis (left-right)
-        'Coronal': np.array([0, 1, 0]),    # A-P axis (anterior-posterior)
-        'Axial': np.array([0, 0, 1])       # S-I axis (superior-inferior)
-    }
 
-    max_dot = 0
-    best_axis = "Unknown"
-
-    for axis_name, base_axis in axes.items():
-        dot_product = np.dot(axis_vector, base_axis)
-        if dot_product > max_dot:
-            max_dot = dot_product
-            best_axis = axis_name
-
-    if max_dot >= alignment_threshold:
-        return best_axis, max_dot
+    # largest component determines the anatomical plane
+    largest_component = np.argmax(axis_vector)
+    if largest_component == 0:
+        name = 'Sagittal'
+        val = axis_vector[0]
+    elif largest_component == 1:
+        name = 'Coronal'
+        val = axis_vector[1]
+    elif largest_component == 2:
+        name = 'Axial'
+        val = axis_vector[2]
     else:
-        return "Oblique", max_dot
+        return "Unknown", 0
+
+    degrees = np.degrees(np.arccos(val/np.linalg.norm(axis_vector)))
+
+    if degrees <= alignment_threshold:
+        return name, degrees
+    else:
+        return "Oblique", degrees
 
 
 def convert_slice_location_to_slice_index_from_dicom(ds: pydicom.Dataset,
