@@ -17,7 +17,7 @@ from pathlib import Path
 from io import BytesIO
 import os
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import uuid
 import hashlib
 from .io_utils import peek, is_io_object
@@ -248,25 +248,6 @@ def load_image_normalized(dicom: pydicom.Dataset, index: int = None) -> np.ndarr
     raise ValueError(f"Unsupported DICOM normalization with shape: {shape}, SamplesPerPixel: {c}, NumberOfFrames: {n}")
 
 
-def _validate_dicoms_for_assembling(dicom_list: Sequence[tuple]) -> None:
-    if len(dicom_list) <= 1:
-        return
-    # Get dimensions from first DICOM
-    first_rows = dicom_list[0][2]
-    first_columns = dicom_list[0][3]
-
-    # Check all other DICOMs have the same dimensions
-    for instance_number, file_path, rows, columns in dicom_list:
-        if rows != first_rows or columns != first_columns:
-            msg = (
-                f"Dimension mismatch: "
-                f"Expected {first_rows}x{first_columns}, got {rows}x{columns} "
-                f"for file {file_path} and {dicom_list[0][1]}"
-            )
-            _LOGGER.error(msg)
-            raise ValueError(msg)
-
-
 def _groupby_anatomicalplane(dslist: Sequence[pydicom.Dataset]) -> dict[str, list[pydicom.Dataset]]:
     """
     Group DICOM datasets by their ImageOrientationPatient attribute.
@@ -279,12 +260,15 @@ def _groupby_anatomicalplane(dslist: Sequence[pydicom.Dataset]) -> dict[str, lis
     return grouped
 
 
-def _group_dicoms_by_tags(dslist: Sequence[pydicom.Dataset], tags: Sequence[str]) -> dict[str, list[pydicom.Dataset]]:
+def _group_dicoms_by_tags(dslist: Sequence[pydicom.Dataset],
+                          tags: Sequence[str],
+                          return_indices: bool = False
+                          ) -> OrderedDict[str, list]:
     """
-    Group DICOM datasets by specific DICOM tags.
+    Group DICOM datasets by specific DICOM tags, returning their indices.
     """
     grouped = defaultdict(list)
-    for ds in dslist:
+    for i, ds in enumerate(dslist):
         # Create a composite key from all groupby_tags
         group_key_parts = []
         for tag_name in tags:
@@ -302,8 +286,12 @@ def _group_dicoms_by_tags(dslist: Sequence[pydicom.Dataset], tags: Sequence[str]
 
         # Create a hashable composite key
         composite_key = tuple(group_key_parts)
-        grouped[composite_key].append(ds)
-    return grouped
+        if return_indices:
+            grouped[composite_key].append(i)
+        else:
+            grouped[composite_key].append(ds)
+
+    return OrderedDict(grouped)
 
 
 def _infer_laterality(dslist: Sequence[pydicom.Dataset],
@@ -447,6 +435,40 @@ def get_dicom_laterality(ds: pydicom.Dataset) -> str | None:
     return ds.get('Laterality')
 
 
+class AssembledDICOMsResult(GeneratorWithLength):
+    """
+    mapping_idx: A sequence of lists of indices. The `mapping_idx[i]` contains the indices of the original DICOMs
+        that were used to create the i-th assembled DICOM.
+
+    inverse_mapping_idx: A list of indices. The `inverse_mapping_idx[j]` gives the index of the assembled DICOM
+        that corresponds to the original DICOM at index j.
+
+    """
+
+    # declare attributes
+    mapping_idx: Sequence[list[int]]
+    inverse_mapping_idx: list[int]
+
+    def __init__(self,
+                 generator: GeneratorWithLength[pydicom.Dataset | IO],
+                 mapping_idx: Sequence[list[int]]):
+        super().__init__(generator.generator, generator.length)
+        self.mapping_idx = mapping_idx
+
+    @property
+    def inverse_mapping_idx(self) -> list[int]:
+        if hasattr(self, '_inverse_mapping_idx'):
+            return self._inverse_mapping_idx
+        inverse_mapping_idx = [-1] * sum(len(l) for l in self.mapping_idx)
+        for i, idx_list in enumerate(self.mapping_idx):
+            for idx in idx_list:
+                inverse_mapping_idx[idx] = i
+        # check inverse mapping
+        assert all(idx != -1 for idx in inverse_mapping_idx), "Inverse mapping contains -1 values."
+
+        self._inverse_mapping_idx = inverse_mapping_idx
+        return inverse_mapping_idx
+
 def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                     return_as_IO: bool = False,
                     groupby_tags: list[str] = ['SeriesInstanceUID',
@@ -459,7 +481,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                                                'Columns'
                                                ],
                     infer_laterality: bool = True
-                    ) -> GeneratorWithLength[pydicom.Dataset | IO]:
+                    ) -> AssembledDICOMsResult:
     """
     Assemble multiple DICOM files into a single multi-frame DICOM file.
     This function will merge the pixel data of the DICOM files and generate a new DICOM file with the combined pixel data.
@@ -475,9 +497,6 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     from tqdm.auto import tqdm
 
     dicoms_map = defaultdict(list)
-
-    # Extend specific_tags to include all groupby_tags
-    specific_tags = ['InstanceNumber', 'Rows', 'Columns'] + groupby_tags
     dicom_list = []
 
     for file_path in tqdm(files_path, desc="Reading DICOMs metadata", unit="file"):
@@ -545,10 +564,13 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                 _LOGGER.warning(f"Error inferring laterality for {composite_key}: {e}")
         ######
 
-    dicoms_map = _group_dicoms_by_tags(dicom_list, groupby_tags)
+    dicoms_map_idxs = _group_dicoms_by_tags(dicom_list, groupby_tags,
+                                            return_indices=True)
+    dicoms_map = {k: [dicom_list[i] for i in v] for k, v in dicoms_map_idxs.items()}
 
     gen = _generate_merged_dicoms(dicoms_map, return_as_IO=return_as_IO)
-    return GeneratorWithLength(gen, len(dicoms_map))
+    return AssembledDICOMsResult(GeneratorWithLength(gen, len(dicoms_map)),
+                                 list(dicoms_map_idxs.values()))
 
 
 def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
@@ -660,7 +682,8 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
 
 
 def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
-                            return_as_IO: bool = False) -> Generator[pydicom.Dataset, None, None]:
+                            return_as_IO: bool = False
+                            ) -> Generator[pydicom.Dataset, None, None] | Generator[BytesIO, None, None]:
     for _, dicoms in dicoms_map.items():
         dicoms.sort(key=lambda ds: 0 if ds.get('InstanceNumber') is None else ds.get('InstanceNumber'))
         # Use the first dicom as a template
