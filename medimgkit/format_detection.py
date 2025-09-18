@@ -128,6 +128,14 @@ def guess_typez(name: str | Path | IO | bytes,
     mime_type, suffix = guess_type(name, use_magic=use_magic)
     if mime_type not in ('application/gzip', 'application/x-gzip'):
         return [mime_type], suffix
+    
+    if mime_type is None:
+        _LOGGER.warning(f'Could not determine MIME type for file: {name}')
+        return [None], None
+
+    if suffix is None:
+        _LOGGER.warning("File has gzip MIME type but unknown extension! This should not happen.")
+        suffix = '.gz'
 
     # Handle gzip files
     if is_io_object(name):
