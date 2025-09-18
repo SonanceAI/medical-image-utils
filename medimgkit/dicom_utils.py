@@ -255,7 +255,7 @@ def _groupby_anatomicalplane(dslist: Sequence[pydicom.Dataset]) -> dict[str, lis
     """
     grouped = defaultdict(list)
     for ds in dslist:
-        plane = determine_anatomical_plane_from_dicom(ds)
+        plane = determine_anatomical_plane_from_dicom(ds, fallback_for_text=True)
         grouped[plane].append(ds)
     return grouped
 
@@ -295,7 +295,8 @@ def _group_dicoms_by_tags(dslist: Sequence[pydicom.Dataset],
 
 
 def _infer_laterality(dslist: Sequence[pydicom.Dataset],
-                      ds_localizers: Sequence[pydicom.Dataset] | None = None) -> Sequence[str | None]:
+                      ds_localizers: Sequence[pydicom.Dataset] | None = None
+                      ) -> tuple[Sequence[str | None], float]:
     """
     Infers the laterality (left/right) of DICOM images based on their Image Patient Position and anatomical orientation.
     If available, it first discovers the axes of the localizers (sagittal, coronal, axial), and then uses this information to determine the laterality.
@@ -306,10 +307,11 @@ def _infer_laterality(dslist: Sequence[pydicom.Dataset],
         ds_localizers: A list of DICOM datasets representing localizers (optional).
 
     Returns:
-        A list of inferred laterality values ('L', 'R', or None) for each DICOM dataset.
+        - A list of inferred laterality values ('L', 'R', or None) for each DICOM dataset.
+        - confidence score (float) indicating the confidence of the inference (0.0 to 1.0).
     """
     if not dslist:
-        return []
+        return [], 1.0
     # Initialize result list
     lateralities: list[str | None] = [None] * len(dslist)
 
@@ -317,22 +319,23 @@ def _infer_laterality(dslist: Sequence[pydicom.Dataset],
     new_dslist_idx = [i for i, ds in enumerate(dslist)
                       if ds.get('NumberOfFrames', 1) == 1 and ds.get('NumberOfSlices', 1) == 1]
     if len(new_dslist_idx) != len(dslist):
-        # _LOGGER.warning(f"non 2d slice not supported")
-        ret = _infer_laterality([dslist[i] for i in new_dslist_idx],
-                                ds_localizers)
+        _LOGGER.debug(f"non 2d slice not supported")
+        ret, conf = _infer_laterality([dslist[i] for i in new_dslist_idx],
+                                      ds_localizers)
         for i, r in enumerate(ret):
             lateralities[new_dslist_idx[i]] = r
-        return lateralities
+        return lateralities, conf
 
     # Check if we have localizers to determine anatomical orientation
     if ds_localizers and len(ds_localizers) > 0:
+        _LOGGER.debug(f'Using {len(ds_localizers)} localizers to determine anatomical planes.')
         grouped_localizers = _groupby_anatomicalplane(ds_localizers)
         # Try to use localizer information to determine axes
         # sagittal_localizer = grouped_localizers.get('Sagittal', [None])[0]
         # coronal_localizer = grouped_localizers.get('Coronal', [None])[0]
         axial_localizer = grouped_localizers.get('Axial', [None])[0]
 
-        # Use sagittal localizer for left/right determination if available
+        # Use axial localizer for left/right determination if available
         if axial_localizer and hasattr(axial_localizer, 'ImageOrientationPatient'):
             try:
                 # Get the row direction from axial localizer (should be left-right axis)
@@ -350,8 +353,11 @@ def _infer_laterality(dslist: Sequence[pydicom.Dataset],
                             x = np.dot(other_pos, left_right_vector)
                             # if the slice is on the "left side" of the localizer, assign 'L', else assign 'R'
                             lateralities[i] = 'L' if x > 0 else 'R'
+                        else:
+                            _LOGGER.debug(
+                                f'DICOM {other_ds.SOPInstanceUID} missing ImagePositionPatient; cannot infer laterality.')
 
-                    return lateralities
+                    return lateralities, abs(row_dir[0])
                 else:
                     _LOGGER.debug(f'Sagittal localizer found, but no significant left-right direction: {row_dir=}')
             except Exception:
@@ -373,7 +379,8 @@ def _infer_laterality(dslist: Sequence[pydicom.Dataset],
                 continue
 
     if not valid_positions:
-        return lateralities
+        _LOGGER.info("No valid ImagePositionPatient found; cannot infer laterality.")
+        return lateralities, 0.0
 
     valid_positions = np.array(valid_positions)
 
@@ -383,17 +390,26 @@ def _infer_laterality(dslist: Sequence[pydicom.Dataset],
     # Handle edge case where all slices have the same X position
     unique_x = np.unique(x_positions)
     if len(unique_x) == 1:
-        return lateralities
+        _LOGGER.info("All slices have the same X position; cannot infer laterality.")
+        return lateralities, 0.0
 
     # Calculate midpoint
     x_midpoint = np.mean(x_positions)
+    x_std = np.std(x_positions)
+    # compute standard above midpoint and below midpoint
+    x_above_mid = x_positions[x_positions > x_midpoint]
+    x_below_mid = x_positions[x_positions < x_midpoint]
+    std_above = np.std(x_above_mid)
+    std_below = np.std(x_below_mid)
+    # if std_above and std_below are too similar to x_std, cancel inference
+    ratio = np.max([std_above, std_below]) / x_std
 
     # Assign laterality based on position relative to midpoint
     for i, valid_idx in enumerate(valid_indices):
         x_pos = x_positions[i]
         lateralities[valid_idx] = 'L' if x_pos > x_midpoint else 'R'
 
-    return lateralities
+    return lateralities, 1-ratio
 
 
 def _find_localizers(dslist: Sequence[pydicom.Dataset]
@@ -469,6 +485,7 @@ class AssembledDICOMsResult(GeneratorWithLength):
         self._inverse_mapping_idx = inverse_mapping_idx
         return inverse_mapping_idx
 
+
 def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                     return_as_IO: bool = False,
                     groupby_tags: list[str] = ['SeriesInstanceUID',
@@ -480,7 +497,8 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                                                'Rows',
                                                'Columns'
                                                ],
-                    infer_laterality: bool = True
+                    infer_laterality: bool = True,
+                    progress_bar: bool = True
                     ) -> AssembledDICOMsResult:
     """
     Assemble multiple DICOM files into a single multi-frame DICOM file.
@@ -499,7 +517,12 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     dicoms_map = defaultdict(list)
     dicom_list = []
 
-    for file_path in tqdm(files_path, desc="Reading DICOMs metadata", unit="file"):
+    if progress_bar:
+        iterable = tqdm(files_path, desc="Reading DICOMs metadata", unit="file")
+    else:
+        iterable = files_path
+
+    for file_path in iterable:
         try:
             if is_io_object(file_path):
                 with peek(file_path):
@@ -527,24 +550,35 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
         for composite_key, grouped_dicoms in dicoms_map.items():
             # if FrameOfReferenceUID is not valid, skip
             if len(grouped_dicoms) == 0 or not grouped_dicoms[0].get('FrameOfReferenceUID'):
+                _LOGGER.info(f"FrameOfReferenceUID not found for {composite_key}, skipping laterality inference.")
                 continue
-            # remove localizers
+            # filter out sagittal dicoms
+
             sagittal_dicoms = [ds for ds in grouped_dicoms
-                               if determine_anatomical_plane_from_dicom(ds, alignment_threshold=15) == 'Sagittal']
+                               if determine_anatomical_plane_from_dicom(ds,
+                                                                        alignment_threshold=40,
+                                                                        fallback_for_text=True) == 'Sagittal']
+            # sagittal dicoms are the ones we want to infer laterality for
             if len(sagittal_dicoms) == 0:
+                _LOGGER.debug(f"No sagittal dicoms found for {composite_key}, skipping laterality inference.")
                 continue
             if all(get_dicom_laterality(ds) in ['L', 'R'] for ds in sagittal_dicoms):
                 # no need to infer laterality
+                _LOGGER.debug(f"Laterality already determined for {composite_key}, skipping inference.")
                 continue
 
             try:
-                lateralities = list(_infer_laterality(sagittal_dicoms, localizers))
+                lateralities, conf = _infer_laterality(sagittal_dicoms, localizers)
+                lateralities = list(lateralities)
+
                 for i, ds in enumerate(sagittal_dicoms):
                     written_lat = get_dicom_laterality(ds)
                     if lateralities[i] is None or written_lat in ['L', 'R']:
                         lateralities[i] = written_lat
-                    elif (written_lat is None or written_lat != 'B') and len(localizers) == 0:
+                    elif (written_lat is None or written_lat != 'B') and len(localizers) == 0 and conf < 0.55:
                         # If no localizers are present and written is not 'B', we can't infer.
+                        _LOGGER.info(
+                            f"No localizers present and written laterality is not 'B'; cannot infer laterality. {conf=}")
                         lateralities[i] = None
                     if lateralities[i] is None:
                         if 'ImageLaterality' in ds:
@@ -560,6 +594,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
                 if len(set_of_lateralities) == 1 and lateralities[0] is not None:
                     for ds in sagittal_dicoms:
                         ds.Laterality = lateralities[0]
+
             except Exception as e:
                 _LOGGER.warning(f"Error inferring laterality for {composite_key}: {e}")
         ######
@@ -575,26 +610,26 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
 
 def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
                                   all_dicoms: Sequence[pydicom.Dataset]) -> pydicom.Dataset:
+    """
+    Create multi-frame AND volume attributes for a merged DICOM dataset.
+    """
+
     ### Shared Functional Groups Sequence ###
-    shared_seq_dataset = pydicom.dataset.Dataset()
+    if hasattr(merged_ds, 'SharedFunctionalGroupsSequence'):
+        shared_seq = merged_ds.SharedFunctionalGroupsSequence
+        shared_seq_dataset = shared_seq[0] if len(shared_seq) > 0 else pydicom.Dataset()
+    else:
+        shared_seq_dataset = pydicom.Dataset()
+    to_check_tags = [('PixelSpacing', 'PixelMeasuresSequence'),
+                     ('SpacingBetweenSlices', 'PixelMeasuresSequence'),
+                     ('ImageOrientationPatient', 'PlaneOrientationSequence')]
 
-    # check if pixel spacing or spacing between slices are equal for all dicoms
-    pixel_spacing = merged_ds.get('PixelSpacing', None)
-    all_pixel_spacing_equal = all(ds.get('PixelSpacing', None) == pixel_spacing
-                                  for ds in all_dicoms)
-    spacing_between_slices = merged_ds.get('SpacingBetweenSlices', None)
-    all_spacing_b_slices_equal = all(ds.get('SpacingBetweenSlices', None) == spacing_between_slices
-                                     for ds in all_dicoms)
-
-    # if they are equal, add them to the shared functional groups sequence
-    if (pixel_spacing is not None and all_pixel_spacing_equal) or (spacing_between_slices is not None and all_spacing_b_slices_equal):
-        pixel_measure = pydicom.dataset.Dataset()
-        if pixel_spacing is not None:
-            pixel_measure.PixelSpacing = pixel_spacing
-        if spacing_between_slices is not None:
-            pixel_measure.SpacingBetweenSlices = spacing_between_slices
-        pixel_measures_seq = pydicom.Sequence([pixel_measure])
-        shared_seq_dataset.PixelMeasuresSequence = pixel_measures_seq
+    for tag, where_to_put in to_check_tags:
+        values = [ds.get(tag) for ds in all_dicoms]
+        if all(v == values[0] and v is not None for v in values):
+            if shared_seq_dataset.get(where_to_put) is None:
+                shared_seq_dataset.__setattr__(where_to_put, pydicom.Sequence([pydicom.Dataset()]))
+            shared_seq_dataset.get(where_to_put)[0].__setattr__(tag, values[0])
 
     if len(shared_seq_dataset) > 0:
         shared_seq = pydicom.Sequence([shared_seq_dataset])
@@ -602,33 +637,27 @@ def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
     #######
 
     ### Per-Frame Functional Groups Sequence ###
+    if hasattr(merged_ds, 'PerFrameFunctionalGroupsSequence'):
+        _LOGGER.info("Merged DICOM already has PerFrameFunctionalGroupsSequence. It will be overwritten.")
+
     perframe_seq_list = []
     for ds in all_dicoms:
-        per_frame_dataset = pydicom.dataset.Dataset()  # root dataset for each frame
-        pos_dataset = pydicom.dataset.Dataset()
-        orient_dataset = pydicom.dataset.Dataset()
-        pixel_measure = pydicom.dataset.Dataset()
-        framenumber_dataset = pydicom.dataset.Dataset()
-
-        if 'ImagePositionPatient' in ds:
-            pos_dataset.ImagePositionPatient = ds.ImagePositionPatient
-        if 'ImageOrientationPatient' in ds:
-            orient_dataset.ImageOrientationPatient = ds.ImageOrientationPatient
-        if 'PixelSpacing' in ds and all_pixel_spacing_equal == False:
-            pixel_measure.PixelSpacing = ds.PixelSpacing
-        if 'SpacingBetweenSlices' in ds and all_spacing_b_slices_equal == False:
-            pixel_measure.SpacingBetweenSlices = ds.SpacingBetweenSlices
-
-        # Add datasets to the per-frame dataset
-        per_frame_dataset.PlanePositionSequence = pydicom.Sequence([pos_dataset])
-        per_frame_dataset.PlaneOrientationSequence = pydicom.Sequence([orient_dataset])
-        per_frame_dataset.PixelMeasuresSequence = pydicom.Sequence([pixel_measure])
-        per_frame_dataset.FrameContentSequence = pydicom.Sequence([framenumber_dataset])
-
-        perframe_seq_list.append(per_frame_dataset)
-    if len(perframe_seq_list[0]) > 0:
-        perframe_seq = pydicom.Sequence(perframe_seq_list)
-        merged_ds.PerFrameFunctionalGroupsSequence = perframe_seq
+        per_frame_dataset = pydicom.Dataset()  # root dataset for each frame
+        for tag, where_to_put in to_check_tags:
+            if ds.get(tag) is None:
+                continue
+            if len(shared_seq_dataset) > 0 and shared_seq_dataset.get(where_to_put) is not None:
+                # This tag is already in SharedFunctionalGroupsSequence, skip
+                continue
+            if per_frame_dataset.get(where_to_put) is None:
+                per_frame_dataset.__setattr__(where_to_put, pydicom.Sequence([pydicom.Dataset()]))
+            per_frame_dataset.get(where_to_put)[0].__setattr__(tag, ds.get(tag))
+            perframe_seq_list.append(per_frame_dataset)
+    if len(perframe_seq_list) > 0:
+        if len(perframe_seq_list) != len(all_dicoms):
+            raise ValueError(
+                f"Number of PerFrameFunctionalGroupsSequence items ({len(perframe_seq_list)}) does not match number of frames ({len(all_dicoms)}).")
+        merged_ds.PerFrameFunctionalGroupsSequence = pydicom.Sequence(perframe_seq_list)
         merged_ds.FrameIncrementPointer = (0x5200, 0x9230)
 
     return merged_ds
@@ -681,6 +710,14 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
     return ds.filename if hasattr(ds, 'filename') else f"merged_dicom_{uuid.uuid4()}.dcm"
 
 
+def _is_multiframe_SOPClass(sop_class_uid: pydicom.uid.UID) -> bool:
+    """Heuristic to determine if a SOP Class UID is multi-frame or video."""
+    name = sop_class_uid.name.lower()
+    if 'multi-frame' in name or 'video' in name:
+        return True
+    return False
+
+
 def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
                             return_as_IO: bool = False
                             ) -> Generator[pydicom.Dataset, None, None] | Generator[BytesIO, None, None]:
@@ -688,12 +725,22 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
         dicoms.sort(key=lambda ds: 0 if ds.get('InstanceNumber') is None else ds.get('InstanceNumber'))
         # Use the first dicom as a template
         merged_dicom = dicoms[0]
+        if len(dicoms) == 1:
+            if return_as_IO:
+                name = _generate_dicom_name(merged_dicom)
+                yield to_bytesio(merged_dicom, name=name)
+            else:
+                yield merged_dicom
+            continue
 
         # Combine pixel data
         pixel_arrays = np.stack([ds.pixel_array for ds in dicoms], axis=0)
 
         # Update the merged dicom
         merged_dicom.PixelData = pixel_arrays.tobytes()
+        if _is_multiframe_SOPClass(merged_dicom.SOPClassUID):
+            if len(pixel_arrays) == 1:
+                _LOGGER.warning('Single frame DICOM detected in multi-frame SOP Class.')
         merged_dicom.NumberOfFrames = len(pixel_arrays)  # Set number of frames
         merged_dicom.SOPInstanceUID = pydicom.uid.generate_uid()  # Generate new SOP Instance UID
         # Removed deprecated attributes and set Transfer Syntax UID instead:
@@ -714,11 +761,20 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
             # TODO: Sometimes FrameTime is present but not equal for all dicoms. In this case, check out 'FrameTimeVector'.
             merged_dicom = _create_multiframe_attributes(merged_dicom, dicoms)
 
+        # add comment tag about merging
+        comment = f"Merged {len(dicoms)} DICOM files into a single DICOM by medimgkit.dicom_utils.assemble_dicoms"
+        if hasattr(merged_dicom, 'ImageComments') and merged_dicom.ImageComments:
+            merged_dicom.ImageComments += " | " + comment
+        else:
+            merged_dicom.ImageComments = comment
+
         # Remove tags of single frame dicoms
         for attr in ['ImagePositionPatient', 'SliceLocation', 'ImageOrientationPatient',
                      'PixelSpacing', 'SpacingBetweenSlices', 'InstanceNumber']:
+            # remove only if they are not all equal
             if hasattr(merged_dicom, attr):
-                delattr(merged_dicom, attr)
+                if not all(ds.get(attr) == merged_dicom.get(attr) for ds in dicoms):
+                    delattr(merged_dicom, attr)
 
         if return_as_IO:
             name = _generate_dicom_name(merged_dicom)
@@ -774,10 +830,20 @@ def get_image_orientation(ds: pydicom.Dataset, slice_index: int) -> np.ndarray:
 
     if ds.get('PerFrameFunctionalGroupsSequence') is not None and len(ds.PerFrameFunctionalGroupsSequence) > 0:
         if 'PlaneOrientationSequence' in ds.PerFrameFunctionalGroupsSequence[slice_index]:
-            return ds.PerFrameFunctionalGroupsSequence[slice_index].PlaneOrientationSequence[0].ImageOrientationPatient
+            if 'ImageOrientationPatient' in ds.PerFrameFunctionalGroupsSequence[slice_index].PlaneOrientationSequence[0]:
+                return ds.PerFrameFunctionalGroupsSequence[slice_index].PlaneOrientationSequence[0].ImageOrientationPatient
 
     if ds.get('SharedFunctionalGroupsSequence') is not None and len(ds.SharedFunctionalGroupsSequence) > 0:
-        return ds.SharedFunctionalGroupsSequence[0].PlaneOrientationSequence[0].ImageOrientationPatient
+        if 'PlaneOrientationSequence' in ds.SharedFunctionalGroupsSequence[0]:
+            if 'ImageOrientationPatient' in ds.SharedFunctionalGroupsSequence[0].PlaneOrientationSequence[0]:
+                return ds.SharedFunctionalGroupsSequence[0].PlaneOrientationSequence[0].ImageOrientationPatient
+
+    # Check Detector Information Sequence (0054,0022)
+    if ds.get('DetectorInformationSequence') is not None and len(ds.DetectorInformationSequence) > 0:
+        # if is a single-frame/single-slice dicom, use the first item
+        idx = 0 if len(ds.DetectorInformationSequence) == 1 else slice_index
+        if 'ImageOrientationPatient' in ds.DetectorInformationSequence[idx]:
+            return ds.DetectorInformationSequence[idx].ImageOrientationPatient
 
     raise ValueError("ImageOrientationPatient not found in DICOM dataset.")
 
@@ -854,6 +920,11 @@ def get_image_position(ds: pydicom.Dataset,
         x = np.array(ds.ImagePositionPatient, dtype=np.float64)
         sc_orient = get_slice_orientation(ds, slice_index)
         return x + sc_orient*(instance_number-ds.get('InstanceNumber', 1))
+
+    # Check Detector Information Sequence (0054,0022)
+    if ds.get('DetectorInformationSequence') is not None and len(ds.DetectorInformationSequence) > 0:
+        if 'ImagePositionPatient' in ds.DetectorInformationSequence[slice_index]:
+            return ds.DetectorInformationSequence[slice_index].ImagePositionPatient
 
     raise ValueError("ImagePositionPatient not found in DICOM dataset.")
 
@@ -936,9 +1007,21 @@ def pixel_to_patient(ds: pydicom.Dataset,
     return patient_coords
 
 
+def _determine_anatomical_plane_from_text(ds: pydicom.Dataset) -> str:
+    text = (ds.get('SeriesDescription', '') + ' ' + ds.get('ProtocolName', '')).upper()
+    if any(keyword in text for keyword in ['AXIAL', ' AX ', 'TRANSVERSE', ' TRA ']):
+        return 'Axial'
+    elif any(keyword in text for keyword in ['SAGITTAL', ' SAG ']):
+        return 'Sagittal'
+    elif any(keyword in text for keyword in ['CORONAL', ' COR ']):
+        return 'Coronal'
+    return "Unknown"
+
+
 def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
                                           slice_axis: int | None = None,
-                                          alignment_threshold: float = 15) -> str:
+                                          alignment_threshold: float = 15,
+                                          fallback_for_text: bool = False) -> str:
     """
     Determine the anatomical plane of a DICOM slice (Axial, Sagittal, Coronal, Oblique, or Unknown).
 
@@ -947,6 +1030,7 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
         slice_axis (int|None): The axis of the slice to analyze (0, 1, or 2). Unnecessary if is a 2d image.
         alignment_threshold (float): Threshold for considering alignment with anatomical axes in degrees.
             Values above this threshold are considered "Oblique".
+        fallback_for_text (bool): If True, use SeriesDescription and ProtocolName to infer plane if orientation data is missing.
 
     Returns:
         str: The name of the anatomical plane ('Axial', 'Sagittal', 'Coronal', 'Oblique', or 'Unknown').
@@ -975,13 +1059,20 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
     # if not present or both are highly different
     if img_orient is None or not np.allclose(img_orient, img_orient_last, atol=1e-3):
         # ImageOrientationPatient is mandatory for some modalities
+        if fallback_for_text:
+            ret = _determine_anatomical_plane_from_text(ds)
+            _LOGGER.debug(f"Falling back to text-based anatomical plane determination: {ret}")
+            return ret
+        msg = f"ImageOrientationPatient is missing or inconsistent in DICOM dataset {ds.filename if hasattr(ds, 'filename') else ds.get('SOPInstanceUID')}"
         if ds.get('Modality') in ['MR', 'CT', 'PT', 'CR']:
-            _LOGGER.warning(
-                f"ImageOrientationPatient not found in DICOM dataset SOPInstanceUID={ds.get('SOPInstanceUID', '')}")
+            _LOGGER.warning(msg)
+        else:
+            _LOGGER.debug(msg)
         return "Unknown"
     # Get the Image Orientation Patient (IOP) - 6 values defining row and column directions
     iop = np.array(img_orient, dtype=float)
     if len(iop) != 6:
+        _LOGGER.info(f"ImageOrientationPatient must have 6 values, found {len(iop)}")
         return "Unknown"
     # Extract row and column direction vectors
     row_dir = iop[:3]  # First 3 values: row direction cosines
@@ -1004,7 +1095,11 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
         examine_vector = col_dir
     # Find which anatomical axis is most aligned with our examine_vector
 
-    return determine_anatomical_plane(examine_vector, alignment_threshold)[0]
+    plane = determine_anatomical_plane(examine_vector, alignment_threshold)[0]
+    if plane != "Unknown" or not fallback_for_text:
+        return plane
+    # Fallback: use SeriesDescription and ProtocolName to infer plane
+    return _determine_anatomical_plane_from_text(ds)
 
 
 def determine_anatomical_plane(axis_vector: np.ndarray,
@@ -1039,6 +1134,7 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
         name = 'Axial'
         val = axis_vector[2]
     else:
+        _LOGGER.debug(f"Unrecognized anatomical plane for {axis_vector} with largest component {largest_component}")
         return "Unknown", 0
 
     degrees = np.degrees(np.arccos(val/np.linalg.norm(axis_vector)))
@@ -1046,6 +1142,7 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
     if degrees <= alignment_threshold:
         return name, degrees
     else:
+        # _LOGGER.debug(f"Anatomical plane for {axis_vector} is oblique with {degrees:.2f} degrees off {name}")
         return "Oblique", degrees
 
 
