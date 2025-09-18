@@ -1,4 +1,5 @@
 from nibabel.spatialimages import SpatialImage
+from nibabel.filebasedimages import ImageFileError
 import numpy as np
 import logging
 from pathlib import Path
@@ -25,7 +26,14 @@ def _read_slice_or_full(nibdata: SpatialImage,
     """
     if slice_index is not None:
         if slice_axis is None:
-            raise ValueError("slice_axis must be provided if slice_index is provided")
+            shape = nibdata.shape
+            if len(shape) < 3:
+                raise ValueError("NIfTI image must be at least 3D to extract a slice")
+            if len(shape) == 3:
+                slice_axis = 2
+            else:
+                slice_axis = 3
+
         return get_slice(nibdata, slice_index, slice_axis)
 
     if slice_axis is not None:
@@ -48,12 +56,9 @@ def read_nifti(file_path: str,
     Returns:
         np.ndarray: Image data with shape (#frames, C, H, W)
     """
-    if slice_index is not None and slice_axis is None:
-        raise ValueError("slice_axis must be provided if slice_index is provided")
     if slice_axis is not None and slice_index is None:
         raise ValueError("slice_index must be provided if slice_axis is provided")
 
-    from nibabel.filebasedimages import ImageFileError
     try:
         nibdata = nib.load(file_path)
         imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
@@ -217,7 +222,7 @@ def get_slice(data: SpatialImage,
         else:
             slice_image = data.get_fdata()[:, :, slice_index]
     else:
-        raise ValueError("Invalid slice axis")
+        raise ValueError(f"Invalid slice axis: {slice_axis}. Must be 0, 1, or 2.")
 
     return slice_image
 
@@ -311,3 +316,32 @@ def axis_name_to_axis_index(data: SpatialImage,
         raise ValueError(f"Unknown axis name: {axis_name}. Expected one of {set(_AXIS_MAPPING.keys())}.")
     axis_index = np.argmax(np.abs(rotation_matrix[:, idx]))
     return axis_index
+
+
+def get_nifti_shape(file_path: str) -> tuple:
+    """
+    Get the shape of a NIfTI file.
+
+    Args:
+        file_path (str): Path to the NIfTI file (.nii or .nii.gz)
+
+    Returns:
+        tuple: Shape of the NIfTI image (X, Y, Z)
+    """
+    try:
+        return nib.load(file_path).shape
+    except ImageFileError as e:
+        from .format_detection import guess_type
+        mimetype, _ = guess_type(file_path)
+        if mimetype is None:
+            raise
+        if mimetype == 'application/gzip':
+            with gzip.open(file_path, 'rb') as f:
+                nibdata = nib.Nifti1Image.from_stream(f)
+                return nibdata.shape
+        elif mimetype in NIFTI_MIMES:
+            with open(file_path, 'rb') as f:
+                nibdata = nib.Nifti1Image.from_stream(f)
+                return nibdata.shape
+        else:
+            raise

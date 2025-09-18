@@ -127,11 +127,19 @@ def read_array_normalized(file_path: str,
             imgs = read_nifti(file_path, 
                               mimetype=mime_type,
                               slice_index=index,
-                              slice_axis=None if index is None else 0)
+                              slice_axis=None)
             # For NIfTI files, try to load associated JSON metadata
             if return_metainfo:
-                json_path = file_path.replace('.nii.gz', '.json').replace('.nii', '.json')
-                if os.path.exists(json_path):
+                if file_path.endswith('.nii.gz'):
+                    json_path = file_path[:-7] + '.json'
+                elif file_path.endswith('.nii'):
+                    json_path = file_path[:-4] + '.json'
+                elif file_path.endswith('.gz'):
+                    json_path = file_path[:-3] + '.json'
+                else:
+                    json_path = None
+
+                if json_path and os.path.exists(json_path):
                     try:
                         import json
                         with open(json_path, 'r') as f:

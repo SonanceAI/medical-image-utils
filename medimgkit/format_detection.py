@@ -54,6 +54,16 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
 
 def guess_type(name: str | Path | IO | bytes,
                use_magic=True):
+    """
+    Guess the MIME type and file extension of a file or file-like object.
+
+    Args:
+        name: The file path, file-like object, or byte data.
+        use_magic: Whether to use magic library for MIME type detection.
+
+    Returns:
+        A tuple of (MIME type, file extension).
+    """
     if isinstance(name, bytes):
         data_bytes = name
         name = ''
