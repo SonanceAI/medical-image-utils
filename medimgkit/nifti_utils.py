@@ -62,9 +62,9 @@ def read_nifti(file_path: str,
     try:
         nibdata = nib.load(file_path)
         imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
-    except ImageFileError as e:
+    except ImageFileError:
         if mimetype is None:
-            raise e
+            raise
         # has_ext = os.path.splitext(file_path)[1] != ''
         if mimetype == 'application/gzip':
             with gzip.open(file_path, 'rb') as f:
@@ -75,7 +75,7 @@ def read_nifti(file_path: str,
                 nibdata = nib.Nifti1Image.from_stream(f)
                 imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
         else:
-            raise e
+            raise
     if imgs.ndim == 2:
         imgs = imgs.transpose(1, 0)
         if slice_index is None:
@@ -85,8 +85,11 @@ def read_nifti(file_path: str,
     elif imgs.ndim == 3 and slice_index is None:
         imgs = imgs.transpose(2, 1, 0)
         imgs = imgs[:, np.newaxis]
+    elif imgs.ndim == 4:
+        # (H, W, #frames, C)
+        imgs = imgs.transpose(2, 3, 1, 0)
     else:
-        raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim}")
+        raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim} with {imgs.shape=}")
 
     return imgs
 
