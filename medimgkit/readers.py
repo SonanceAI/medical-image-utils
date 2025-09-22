@@ -31,7 +31,7 @@ from PIL import Image
 import logging
 from .nifti_utils import read_nifti
 from .dicom_utils import load_image_normalized as read_dicom
-from .format_detection import guess_type
+from .format_detection import guess_type, GZIP_MIME_TYPES
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ def read_array_normalized(file_path: str,
             if hasattr(ds, 'PixelData'):
                 ds.PixelData = None
             metainfo = ds
-        elif mime_type.endswith('nifti') or mime_type == 'application/gzip':
+        elif mime_type.endswith('nifti') or mime_type in GZIP_MIME_TYPES:
             imgs = read_nifti(file_path, 
                               mimetype=mime_type,
                               slice_index=index,
