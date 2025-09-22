@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import nibabel as nib
 import gzip
+from medimgkit import GZIP_MIME_TYPES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def read_nifti(file_path: str,
         if mimetype is None:
             raise
         # has_ext = os.path.splitext(file_path)[1] != ''
-        if mimetype == 'application/gzip':
+        if mimetype in GZIP_MIME_TYPES:
             with gzip.open(file_path, 'rb') as f:
                 nibdata = nib.Nifti1Image.from_stream(f)
                 imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
@@ -251,7 +252,7 @@ def is_nifti_file(file_path: Path | str) -> bool:
         file_type = magic.from_file(str(file_path), mime=True)
         if file_type in NIFTI_MIMES:
             return True
-        if file_type == 'application/gzip':
+        if file_type in GZIP_MIME_TYPES:
             with gzip.open(file_path, 'rb') as f:
                 subfiletype = magic.from_buffer(f.read(1024), mime=True)
             if subfiletype in NIFTI_MIMES:
@@ -338,7 +339,7 @@ def get_nifti_shape(file_path: str) -> tuple:
         mimetype, _ = guess_type(file_path)
         if mimetype is None:
             raise
-        if mimetype == 'application/gzip':
+        if mimetype in GZIP_MIME_TYPES:
             with gzip.open(file_path, 'rb') as f:
                 nibdata = nib.Nifti1Image.from_stream(f)
                 return nibdata.shape

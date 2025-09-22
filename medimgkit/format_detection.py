@@ -7,10 +7,10 @@ from typing import IO
 from .io_utils import is_io_object, peek
 import gzip
 import io
+from medimgkit import GZIP_MIME_TYPES
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_MIME_TYPE = 'application/octet-stream'
-GZIP_MIME_TYPES = ('application/gzip', 'application/x-gzip')
 
 _MIME_MAP = {
     'application/x-numpy-data': '.npy',

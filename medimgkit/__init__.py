@@ -7,9 +7,11 @@ _MAP_STANDARD_MIME_TYPES_ = {
     "image/dicom": "application/dicom",
     'image/x-dicom': 'application/dicom',
     "image/nifti": "application/nifti",
-    'application/x-nifti': 'application/nifti'
+    'application/x-nifti': 'application/nifti',
+    'application/x-gzip': 'application/gzip',
 }
 
+GZIP_MIME_TYPES = ('application/gzip', 'application/x-gzip')
 
 def standardize_mimetype(mimetype: str) -> str:
     """
