@@ -10,6 +10,7 @@ import io
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_MIME_TYPE = 'application/octet-stream'
+GZIP_MIME_TYPES = ('application/gzip', 'application/x-gzip')
 
 _MIME_MAP = {
     'application/x-numpy-data': '.npy',
@@ -126,7 +127,7 @@ def guess_typez(name: str | Path | IO | bytes,
         A tuple of (MIME type, file extension).
     """
     mime_type, suffix = guess_type(name, use_magic=use_magic)
-    if mime_type not in ('application/gzip', 'application/x-gzip'):
+    if mime_type not in GZIP_MIME_TYPES:
         return [mime_type], suffix
     
     if mime_type is None:
