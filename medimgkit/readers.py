@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import logging
-from .nifti_utils import read_nifti
+from .nifti_utils import read_nifti, NIFTI_MIMES
 from .dicom_utils import load_image_normalized as read_dicom
 from .format_detection import guess_type, GZIP_MIME_TYPES
 from typing import Any
@@ -124,12 +124,13 @@ def read_array_normalized(file_path: str,
                 ds.PixelData = None
             metainfo = ds
         elif mime_type.endswith('nifti') or mime_type in GZIP_MIME_TYPES:
-            imgs = read_nifti(file_path, 
-                              mimetype=mime_type,
-                              slice_index=index,
-                              slice_axis=None)
+            imgs, nibmetainfo = read_nifti(file_path,
+                                           mimetype=mime_type,
+                                           slice_index=index,
+                                           slice_axis=None)
             # For NIfTI files, try to load associated JSON metadata
             if return_metainfo:
+                metainfo = nibmetainfo
                 if file_path.endswith('.nii.gz'):
                     json_path = file_path[:-7] + '.json'
                 elif file_path.endswith('.nii'):
@@ -147,7 +148,6 @@ def read_array_normalized(file_path: str,
                         _LOGGER.debug(f"Loaded JSON metadata from {json_path}")
                     except Exception as e:
                         _LOGGER.warning(f"Failed to load JSON metadata from {json_path}: {e}")
-                        metainfo = None
         else:
             if mime_type.startswith('video/'):
                 imgs = read_video(file_path, index)
@@ -160,7 +160,8 @@ def read_array_normalized(file_path: str,
                 if isinstance(imgs, np.lib.npyio.NpzFile):
                     imgs = imgs[imgs.files[0]]
                 if imgs.ndim != 4:
-                    raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim}. Expected 4 (N, C, H, W).")
+                    raise ValueError(
+                        f"Unsupported number of dimensions in '{file_path}': {imgs.ndim}. Expected 4 (N, C, H, W).")
             else:
                 raise ValueError(f"Unsupported file format '{mime_type}' of '{file_path}'")
 

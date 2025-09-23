@@ -46,7 +46,7 @@ def _read_slice_or_full(nibdata: SpatialImage,
 def read_nifti(file_path: str,
                mimetype: str | None = None,
                slice_index: int | None = None,
-               slice_axis: int | None = None) -> np.ndarray:
+               slice_axis: int | None = None) -> tuple[np.ndarray, SpatialImage]:
     """
     Read a NIfTI file and return the image data in standardized format.
 
@@ -92,7 +92,10 @@ def read_nifti(file_path: str,
     else:
         raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim} with {imgs.shape=}")
 
-    return imgs
+    # remove any cached data to free up memory
+    if hasattr(nibdata, 'uncache'):
+        nibdata.uncache()
+    return imgs, nibdata
 
 
 def slice_location_to_slice_index(data: SpatialImage,
