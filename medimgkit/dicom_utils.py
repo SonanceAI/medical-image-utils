@@ -728,7 +728,14 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
         merged_dicom = dicoms[0]
         if len(dicoms) == 1:
             if return_as_IO:
-                name = _generate_dicom_name(merged_dicom)
+                # generate base name
+                base_name = _generate_dicom_name(merged_dicom)
+                # include original absolute path if available
+                original_path = getattr(dicoms[0], 'filename', None)
+                if original_path:
+                    name = os.path.join(os.path.abspath(original_path), base_name)
+                else:
+                    name = base_name
                 yield to_bytesio(merged_dicom, name=name)
             else:
                 yield merged_dicom
@@ -782,7 +789,15 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
                     delattr(merged_dicom, attr)
 
         if return_as_IO:
-            name = _generate_dicom_name(merged_dicom)
+            # generate base name
+            base_name = _generate_dicom_name(merged_dicom)
+            # include original absolute path from first input dataset
+            original_path = getattr(dicoms[0], 'filename', None)
+            if original_path:
+                name = os.path.dirname(os.path.abspath(original_path))
+                name = os.path.join(name, base_name)
+            else:
+                name = base_name
             yield to_bytesio(merged_dicom, name=name)
         else:
             yield merged_dicom
