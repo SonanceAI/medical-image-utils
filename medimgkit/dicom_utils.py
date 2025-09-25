@@ -1,8 +1,7 @@
 import pandas as pd
 from pydicom import dcmread
-from pydicom.pixels import pixel_array
+from pydicom.pixels.utils import pixel_array
 import pydicom
-import pydicom.dataset
 import pydicom.datadict
 from pydicom.uid import generate_uid
 import pydicom.uid
@@ -425,17 +424,17 @@ def _find_localizers(dslist: Sequence[pydicom.Dataset]
         - localizers: DICOM datasets identified as localizers.
         - non_localizers: DICOM datasets not identified as localizers.
     """
-    LOCALIZER_NAMES = ['LOCALIZER', 'SCOUT', 'PILOT', 'TOPOGRAM']
+    LOCALIZER_NAMES = ['LOCALIZER', 'SCOUT', 'PILOT', 'TOPOGRAM', 'TRACKER', 'SURVEY']
     localizers = []
     non_localizers = []
     for ds in dslist:
         imagetype = ds.get('ImageType', [])
         imagetype = [s.upper().strip() for s in imagetype]
-        imagetype.extend([ds.get('ProtocolName'), ds.get('SeriesDescription')])
-        for loc_name in LOCALIZER_NAMES:
-            if loc_name in imagetype:
-                localizers.append(ds)
-                break
+        imagetype.extend([ds.get('ProtocolName', '').upper(),
+                          ds.get('SeriesDescription', '').upper()])
+        imagetype_flat = ';'.join(imagetype)
+        if any(name in imagetype_flat for name in LOCALIZER_NAMES):
+            localizers.append(ds)
         else:
             non_localizers.append(ds)
     return localizers, non_localizers
@@ -546,6 +545,7 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     if infer_laterality:
         ### infer laterality and update tag if necessary ###
         localizers, non_localizers = _find_localizers(dicom_list)
+        _LOGGER.debug(f'{len(localizers)=}, {len(non_localizers)=}`')
         dicoms_map = _group_dicoms_by_tags(dicom_list, ['FrameOfReferenceUID'])
         for composite_key, grouped_dicoms in dicoms_map.items():
             # if FrameOfReferenceUID is not valid, skip
@@ -620,7 +620,8 @@ def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
         shared_seq_dataset = shared_seq[0] if len(shared_seq) > 0 else pydicom.Dataset()
     else:
         shared_seq_dataset = pydicom.Dataset()
-    to_check_tags = [('PixelSpacing', 'PixelMeasuresSequence'),
+    to_check_tags = [('ImagePositionPatient', 'PlanePositionSequence'),
+                     ('PixelSpacing', 'PixelMeasuresSequence'),
                      ('SpacingBetweenSlices', 'PixelMeasuresSequence'),
                      ('ImageOrientationPatient', 'PlaneOrientationSequence')]
 
@@ -652,11 +653,11 @@ def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
             if per_frame_dataset.get(where_to_put) is None:
                 per_frame_dataset.__setattr__(where_to_put, pydicom.Sequence([pydicom.Dataset()]))
             per_frame_dataset.get(where_to_put)[0].__setattr__(tag, ds.get(tag))
-            perframe_seq_list.append(per_frame_dataset)
+        perframe_seq_list.append(per_frame_dataset)
     if len(perframe_seq_list) > 0:
         if len(perframe_seq_list) != len(all_dicoms):
             raise ValueError(
-                f"Number of PerFrameFunctionalGroupsSequence items ({len(perframe_seq_list)}) does not match number of frames ({len(all_dicoms)}).")
+                f"Number of PerFrameFunctionalGroupsSequence items ({len(perframe_seq_list)}) does not match number of frames ({len(all_dicoms)}) for {merged_ds.AccessionNumber}")
         merged_ds.PerFrameFunctionalGroupsSequence = pydicom.Sequence(perframe_seq_list)
         merged_ds.FrameIncrementPointer = (0x5200, 0x9230)
 
@@ -741,6 +742,10 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
         if _is_multiframe_SOPClass(merged_dicom.SOPClassUID):
             if len(pixel_arrays) == 1:
                 _LOGGER.warning('Single frame DICOM detected in multi-frame SOP Class.')
+        elif merged_dicom.get('SOPClassUID') == pydicom.uid.MRImageStorage:  # single-frame MR Image Storage
+            _LOGGER.info(f"Converting single-frame SOP Class UID to multi-frame.")
+            merged_dicom.SOPClassUID = pydicom.uid.EnhancedMRImageStorage  # Multi-frame MR Image Storage
+            merged_dicom.file_meta.MediaStorageSOPClassUID = merged_dicom.SOPClassUID
         merged_dicom.NumberOfFrames = len(pixel_arrays)  # Set number of frames
         merged_dicom.SOPInstanceUID = pydicom.uid.generate_uid()  # Generate new SOP Instance UID
         # Removed deprecated attributes and set Transfer Syntax UID instead:
