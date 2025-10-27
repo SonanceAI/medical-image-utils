@@ -54,13 +54,15 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
 
 
 def guess_type(name: str | Path | IO | bytes,
-               use_magic=True):
+               use_magic=True,
+               force_magic=False):
     """
     Guess the MIME type and file extension of a file or file-like object.
 
     Args:
         name: The file path, file-like object, or byte data.
         use_magic: Whether to use magic library for MIME type detection.
+        force_magic: Whether to force using magic library for MIME type detection.
 
     Returns:
         A tuple of (MIME type, file extension).
@@ -86,12 +88,18 @@ def guess_type(name: str | Path | IO | bytes,
     name = Path(name).expanduser()
     suffix = name.suffix
 
-    if suffix in ('.npy', '.npz'):
-        return 'application/x-numpy-data', suffix
-    if suffix == '.gz':
-        return 'application/gzip', suffix
-    if suffix in NIFTI_EXTENSIONS:
-        return DEFAULT_NIFTI_MIME, suffix
+    if not force_magic:
+        if suffix in ('.npy', '.npz'):
+            return 'application/x-numpy-data', suffix
+        if suffix == '.gz':
+            return 'application/gzip', suffix
+        if suffix in NIFTI_EXTENSIONS:
+            return DEFAULT_NIFTI_MIME, suffix
+    
+        mime_type, encoding = mimetypes.guess_type(name, strict=False)
+        if mime_type and mime_type != DEFAULT_MIME_TYPE:
+            suffix = guess_extension(mime_type)
+            return mime_type, suffix
 
     # Try magic if requested
     if use_magic:
@@ -103,18 +111,16 @@ def guess_type(name: str | Path | IO | bytes,
                 with open(name, 'rb') as f:
                     data_bytes = f.read(2048)
         mime_type = magic_from_buffer(data_bytes, mime=True).strip()
-        if mime_type != DEFAULT_MIME_TYPE:
+        if mime_type:
             suffix = guess_extension(mime_type)
             return mime_type, suffix
 
-    mime_type, encoding = mimetypes.guess_type(name, strict=False)
-    suffix = guess_extension(mime_type) if mime_type else None
-
-    return mime_type, suffix
+    return None, suffix
 
 
 def guess_typez(name: str | Path | IO | bytes,
-                use_magic=True) -> tuple[list[str | None], str | None]:
+                use_magic=True,
+                force_magic=False) -> tuple[list[str | None], str | None]:
     """
     Guess the MIME type and file extension of a file or file-like object,
     handling compressed files properly.
@@ -122,11 +128,12 @@ def guess_typez(name: str | Path | IO | bytes,
     Args:
         name: The file path, file-like object, or byte data.
         use_magic: Whether to use magic library for MIME type detection.
+        force_magic: Whether to force using magic library for MIME type detection.
 
     Returns:
         A tuple of (MIME type, file extension).
     """
-    mime_type, suffix = guess_type(name, use_magic=use_magic)
+    mime_type, suffix = guess_type(name, use_magic=use_magic, force_magic=force_magic)
     if mime_type not in GZIP_MIME_TYPES:
         return [mime_type], suffix
     
@@ -143,13 +150,13 @@ def guess_typez(name: str | Path | IO | bytes,
     if is_io_object(name):
         with peek(name) as io_obj:
             with gzip.open(io_obj, 'rb') as gz:
-                mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
+                mime_type2, suffix2 = guess_type(gz, use_magic=use_magic, force_magic=force_magic)
     elif isinstance(name, bytes):
         with gzip.open(io.BytesIO(name), 'rb') as gz:
-            mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
+            mime_type2, suffix2 = guess_type(gz, use_magic=use_magic, force_magic=force_magic)
     else:
         with gzip.open(name, 'rb') as gz:
-            mime_type2, suffix2 = guess_type(gz, use_magic=use_magic)
+            mime_type2, suffix2 = guess_type(gz, use_magic=use_magic, force_magic=force_magic)
 
     if suffix2 is None:
         suffix2 = ''

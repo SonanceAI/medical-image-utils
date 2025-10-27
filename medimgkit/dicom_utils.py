@@ -742,6 +742,14 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
             continue
 
         # Combine pixel data
+        # check if all dicoms have the same Rows and Columns. Raise error if not with details.
+        first_rows = dicoms[0].Rows
+        first_cols = dicoms[0].Columns
+        for ds in dicoms[1:]:
+            if ds.Rows != first_rows or ds.Columns != first_cols:
+                raise ValueError(f"Cannot merge DICOMs with different Rows and Columns: "
+                                 f"{dicoms[0].SOPInstanceUID} has ({first_rows}, {first_cols}), "
+                                 f"but {ds.SOPInstanceUID} has ({ds.Rows}, {ds.Columns}).")
         pixel_arrays = np.stack([ds.pixel_array for ds in dicoms], axis=0)
 
         # Update the merged dicom
