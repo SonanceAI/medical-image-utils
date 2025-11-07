@@ -698,11 +698,11 @@ def _generate_dicom_name(ds: pydicom.Dataset) -> str:
 
     # Join components and add extension
     if len(components) > 0:
-        description = "_".join(str(x) for x in components) + ".dcm"
+        description = "_".join(str(x) for x in components)
         # Clean description - remove special chars and spaces
         description = "".join(c if c.isalnum() else "_" for c in description)
         if len(description) > 0:
-            return description
+            return description + ".dcm"
 
     if ds.get('SeriesInstanceUID'):
         return ds.SeriesInstanceUID + ".dcm"
