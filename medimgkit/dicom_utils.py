@@ -21,6 +21,8 @@ import uuid
 import hashlib
 from .io_utils import peek, is_io_object
 
+DICOM_EXTENSIONS = ['.dcm', '.dicom']
+
 _LOGGER = logging.getLogger(__name__)
 
 CLEARED_STR = "CLEARED_BY_DATAMINT"
@@ -177,7 +179,7 @@ def is_dicom(f: str | Path | IO | bytes) -> bool:
         return False
 
     fname = f.lower()
-    if fname.endswith('.dcm') or fname.endswith('.dicom'):
+    if any(fname.endswith(ext) for ext in DICOM_EXTENSIONS):
         return True
 
     # Check if the file has an extension

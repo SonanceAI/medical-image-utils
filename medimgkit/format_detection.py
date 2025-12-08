@@ -1,7 +1,7 @@
 from .nifti_utils import check_nifti_magic_numbers, NIFTI_MIMES, NIFTI_EXTENSIONS, DEFAULT_NIFTI_MIME
 import mimetypes
 from pathlib import Path
-from .dicom_utils import is_dicom
+from .dicom_utils import is_dicom, DICOM_EXTENSIONS
 import logging
 from typing import IO
 from .io_utils import is_io_object, peek
@@ -95,6 +95,8 @@ def guess_type(name: str | Path | IO | bytes,
             return 'application/gzip', suffix
         if suffix in NIFTI_EXTENSIONS:
             return DEFAULT_NIFTI_MIME, suffix
+        if suffix in DICOM_EXTENSIONS:
+            return 'application/dicom', suffix
     
         mime_type, encoding = mimetypes.guess_type(name, strict=False)
         if mime_type and mime_type != DEFAULT_MIME_TYPE:
