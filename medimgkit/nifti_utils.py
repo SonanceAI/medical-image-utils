@@ -352,3 +352,45 @@ def get_nifti_shape(file_path: str) -> tuple:
                 return nibdata.shape
         else:
             raise
+
+
+def world_to_voxel(data: SpatialImage,
+                   world_coords: np.ndarray) -> np.ndarray:
+    """
+    Convert world coordinates to voxel indices in the NIfTI image.
+
+    Args:
+        data (SpatialImage): The NIfTI image data.
+        world_coords (np.ndarray): World coordinates of shape (N, 3), for multiple points, or (3,), for a single point.
+
+    Returns:
+        np.ndarray: Voxel indices of shape (N, 3) or (3,).
+
+    """
+
+    if world_coords.ndim == 1:
+        single_point = True
+        if world_coords.size != 3:
+            raise ValueError("world_coords must be of shape (3,) for a single point.")
+        world_coords = world_coords[np.newaxis, :]  # Convert to shape (1, 3)
+    elif world_coords.ndim == 2:
+        single_point = False
+        if world_coords.shape[1] != 3:
+            raise ValueError("world_coords must be of shape (N, 3) for multiple points.")
+    else:
+        raise ValueError("world_coords must be either 1D or 2D numpy array.")
+
+    # 1. Convert world coordinates to voxel coordinates
+    inv_affine = np.linalg.inv(data.affine)
+    # Add homogeneous coordinate (w=1)
+    points_hom = np.hstack((world_coords, np.ones((world_coords.shape[0], 1))))
+    # Apply inverse affine transformation
+    voxel_points = points_hom @ inv_affine.T
+    # Remove homogeneous coordinate
+    voxel_points = voxel_points[:, :3]
+
+    # 2. Round to nearest integer voxel indices
+    voxel_indices = np.rint(voxel_points).astype(int)
+    if single_point:
+        return voxel_indices[0]
+    return voxel_indices
