@@ -1,7 +1,9 @@
 import pytest
 import pydicom
 import pydicom.uid
-from medimgkit.dicom_utils import anonymize_dicom, CLEARED_STR, is_dicom, TokenMapper
+import numpy as np
+
+from medimgkit.dicom_utils import anonymize_dicom, CLEARED_STR, is_dicom, TokenMapper, build_affine_matrix
 import pydicom.data
 from io import BytesIO
 import warnings
@@ -226,3 +228,88 @@ class TestDicomUtils:
         assert '.' in uid_token
         # Simple token should be a hash (no dots typically)
         assert '.' not in simple_token
+
+    def test_build_affine_matrix_single_slice(self):
+        ds = pydicom.Dataset()
+        ds.ImagePositionPatient = [10.0, 20.0, 30.0]
+        # row dir then col dir
+        ds.ImageOrientationPatient = [1.0, 0.0, 0.0,
+                                      0.0, 1.0, 0.0]
+        # PixelSpacing: [row_spacing, col_spacing]
+        ds.PixelSpacing = [2.0, 3.0]
+        ds.SpacingBetweenSlices = 4.0
+
+        aff = build_affine_matrix(ds)
+        expected = np.array([
+            [2.0, 0.0, 0.0, 10.0],
+            [0.0, 3.0, 0.0, 20.0],
+            [0.0, 0.0, 4.0, 30.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        assert np.allclose(aff, expected)
+
+    def test_build_affine_matrix_multiframe_perframe_sequences(self):
+        ds = pydicom.Dataset()
+        ds.NumberOfFrames = 3
+
+        # Shared pixel spacing is optional; we set via per-frame PixelMeasuresSequence
+        perframe = []
+        for i in range(int(ds.NumberOfFrames)):
+            frame = pydicom.Dataset()
+
+            pos_seq_item = pydicom.Dataset()
+            pos_seq_item.ImagePositionPatient = [0.0, 0.0, float(i) * 5.0]
+            frame.PlanePositionSequence = [pos_seq_item]
+
+            orient_seq_item = pydicom.Dataset()
+            orient_seq_item.ImageOrientationPatient = [1.0, 0.0, 0.0,
+                                                       0.0, 1.0, 0.0]
+            frame.PlaneOrientationSequence = [orient_seq_item]
+
+            meas_seq_item = pydicom.Dataset()
+            meas_seq_item.PixelSpacing = [1.0, 1.0]
+            meas_seq_item.SpacingBetweenSlices = 5.0
+            frame.PixelMeasuresSequence = [meas_seq_item]
+
+            perframe.append(frame)
+
+        ds.PerFrameFunctionalGroupsSequence = perframe
+
+        aff = build_affine_matrix(ds)
+        expected = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        assert np.allclose(aff, expected)
+
+    def test_build_affine_matrix_raises_on_inconsistent_orientation(self):
+        ds = pydicom.Dataset()
+        ds.NumberOfFrames = 2
+
+        f0 = pydicom.Dataset()
+        f0.PlanePositionSequence = [pydicom.Dataset()]
+        f0.PlanePositionSequence[0].ImagePositionPatient = [0.0, 0.0, 0.0]
+        f0.PlaneOrientationSequence = [pydicom.Dataset()]
+        f0.PlaneOrientationSequence[0].ImageOrientationPatient = [1.0, 0.0, 0.0,
+                                                                  0.0, 1.0, 0.0]
+        f0.PixelMeasuresSequence = [pydicom.Dataset()]
+        f0.PixelMeasuresSequence[0].PixelSpacing = [1.0, 1.0]
+        f0.PixelMeasuresSequence[0].SpacingBetweenSlices = 5.0
+
+        f1 = pydicom.Dataset()
+        f1.PlanePositionSequence = [pydicom.Dataset()]
+        f1.PlanePositionSequence[0].ImagePositionPatient = [0.0, 0.0, 5.0]
+        f1.PlaneOrientationSequence = [pydicom.Dataset()]
+        # swapped/rotated orientation
+        f1.PlaneOrientationSequence[0].ImageOrientationPatient = [0.0, 1.0, 0.0,
+                                                                  1.0, 0.0, 0.0]
+        f1.PixelMeasuresSequence = [pydicom.Dataset()]
+        f1.PixelMeasuresSequence[0].PixelSpacing = [1.0, 1.0]
+        f1.PixelMeasuresSequence[0].SpacingBetweenSlices = 5.0
+
+        ds.PerFrameFunctionalGroupsSequence = [f0, f1]
+
+        with pytest.raises(ValueError):
+            build_affine_matrix(ds)

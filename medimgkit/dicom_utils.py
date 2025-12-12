@@ -29,6 +29,11 @@ CLEARED_STR = "CLEARED_BY_DATAMINT"
 REPORT_MODALITIES = {'SR', 'DOC', 'KO', 'PR', 'ESR'}
 
 
+class InconsistentDICOMFramesError(ValueError):
+    """Raised when DICOM frames have inconsistent geometry that prevents building a single affine matrix."""
+    pass
+
+
 def set_cleared_string(value: str):
     """Set the cleared string value."""
     global CLEARED_STR
@@ -985,18 +990,99 @@ def get_pixel_spacing(ds: pydicom.Dataset, slice_index: int) -> np.ndarray:
     raise ValueError("PixelSpacing not found in DICOM dataset.")
 
 
+def get_number_of_slices(ds: pydicom.Dataset) -> int:
+    n = ds.get('NumberOfFrames', 1)
+    n = max(n, ds.get('ImagesInAcquisition', 1))
+    n = max(n, ds.get('NumberOfSlices', 1))
+    n = max(n, len(ds.get('PerFrameFunctionalGroupsSequence', [])))
+    return int(n)
+
+
+def _extract_geometry(ds: pydicom.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extract geometry (origins, row_vectors, col_vectors, spacings) for all frames.
+    Returns:
+        origins: (N, 3)
+        row_vectors: (N, 3)
+        col_vectors: (N, 3)
+        spacings: (N, 2)
+    """
+    num_frames = get_number_of_slices(ds)
+
+    # Pre-allocate
+    origins = np.zeros((num_frames, 3))
+    row_vectors = np.zeros((num_frames, 3))
+    col_vectors = np.zeros((num_frames, 3))
+    spacings = np.zeros((num_frames, 2))
+
+    # Optimization for PerFrameFunctionalGroupsSequence
+    if 'PerFrameFunctionalGroupsSequence' in ds:
+        shared_pos = None
+        shared_orient = None
+        shared_spacing = None
+
+        if 'SharedFunctionalGroupsSequence' in ds and len(ds.SharedFunctionalGroupsSequence) > 0:
+            shared = ds.SharedFunctionalGroupsSequence[0]
+            if 'PlanePositionSequence' in shared and 'ImagePositionPatient' in shared.PlanePositionSequence[0]:
+                shared_pos = np.array(shared.PlanePositionSequence[0].ImagePositionPatient, dtype=float)
+            if 'PlaneOrientationSequence' in shared and 'ImageOrientationPatient' in shared.PlaneOrientationSequence[0]:
+                shared_orient = np.array(shared.PlaneOrientationSequence[0].ImageOrientationPatient, dtype=float)
+            if 'PixelMeasuresSequence' in shared and 'PixelSpacing' in shared.PixelMeasuresSequence[0]:
+                shared_spacing = np.array(shared.PixelMeasuresSequence[0].PixelSpacing, dtype=float)
+
+        for i, frame in enumerate(ds.PerFrameFunctionalGroupsSequence):
+            # Position
+            if 'PlanePositionSequence' in frame and 'ImagePositionPatient' in frame.PlanePositionSequence[0]:
+                origins[i] = frame.PlanePositionSequence[0].ImagePositionPatient
+            elif shared_pos is not None:
+                origins[i] = shared_pos
+            else:
+                origins[i] = get_image_position(ds, i)
+
+            # Orientation
+            if 'PlaneOrientationSequence' in frame and 'ImageOrientationPatient' in frame.PlaneOrientationSequence[0]:
+                orient = frame.PlaneOrientationSequence[0].ImageOrientationPatient
+            elif shared_orient is not None:
+                orient = shared_orient
+            else:
+                orient = get_image_orientation(ds, i)
+
+            row_vectors[i] = orient[:3]
+            col_vectors[i] = orient[3:]
+
+            # Spacing
+            if 'PixelMeasuresSequence' in frame and 'PixelSpacing' in frame.PixelMeasuresSequence[0]:
+                spacings[i] = frame.PixelMeasuresSequence[0].PixelSpacing
+            elif shared_spacing is not None:
+                spacings[i] = shared_spacing
+            else:
+                spacings[i] = get_pixel_spacing(ds, i)
+
+    else:
+        # Fallback loop using helpers
+        for i in range(num_frames):
+            origins[i] = get_image_position(ds, i)
+            orient = get_image_orientation(ds, i)
+            row_vectors[i] = orient[:3]
+            col_vectors[i] = orient[3:]
+            spacings[i] = get_pixel_spacing(ds, i)
+
+    return origins, row_vectors, col_vectors, spacings
+
+
 def pixel_to_patient(ds: pydicom.Dataset,
-                     pixel_x, pixel_y,
-                     slice_index: int | None = None,
+                     pixel_x: float | np.ndarray,
+                     pixel_y: float | np.ndarray,
+                     slice_index: int | np.ndarray | None = None,
                      instance_number: int | None = None) -> np.ndarray:
     """
     Convert pixel coordinates (pixel_x, pixel_y) to patient coordinates in DICOM.
 
     Parameters:
         ds (pydicom.Dataset): The DICOM dataset containing image metadata.
-        pixel_x (float): X coordinate in pixel space.
-        pixel_y (float): Y coordinate in pixel space.
-        slice_index (int): Index of the slice of the `ds.pixel_array`.
+        pixel_x (float | np.ndarray): X coordinate in pixel space (column index).
+        pixel_y (float | np.ndarray): Y coordinate in pixel space (row index).
+        slice_index (int | np.ndarray): Index of the slice of the `ds.pixel_array`.
         instance_number (int): Instance number of the slice in the 3D volume.
 
 
@@ -1011,30 +1097,269 @@ def pixel_to_patient(ds: pydicom.Dataset,
     if slice_index is not None and instance_number is not None:
         raise ValueError("Either slice_index or instance_number should be provided, not both.")
 
+    # Normalize inputs to arrays
+    pixel_x = np.atleast_1d(pixel_x)
+    pixel_y = np.atleast_1d(pixel_y)
+
     if slice_index is None:
         if instance_number is None:
             instance_number = _get_instance_number(ds)
+
+        # If instance_number is provided, convert to slice_index
         root_instance_number = ds.get('InstanceNumber', 1)
         if root_instance_number is None:
             root_instance_number = 1
         slice_index = instance_number - root_instance_number
 
-    # Get required DICOM attributes
-    image_position = np.array(get_image_position(ds, slice_index), dtype=np.float64)
-    image_orientation = np.array(get_image_orientation(ds, slice_index), dtype=np.float64).reshape(2, 3)
-    # image_position = np.array(ds.ImagePositionPatient, dtype=np.float64)  # (0020,0032)
-    # image_orientation = np.array(ds.ImageOrientationPatient, dtype=np.float64).reshape(2, 3)  # (0020,0037)
-    # pixel_spacing = np.array(ds.PixelSpacing, dtype=np.float64)  # (0028,0030)
-    pixel_spacing = np.array(get_pixel_spacing(ds, slice_index), dtype=np.float64)  # (0028,0030)
+    slice_index = np.atleast_1d(slice_index)
 
-    # Compute row and column vectors from image orientation
-    row_vector = image_orientation[0]
-    col_vector = image_orientation[1]
+    # If slice_index is scalar (size 1), we can use the fast path (single geometry).
+    if slice_index.size == 1:
+        idx = int(slice_index[0])
+        image_position = np.array(get_image_position(ds, idx), dtype=np.float64)
+        image_orientation = np.array(get_image_orientation(ds, idx), dtype=np.float64).reshape(2, 3)
+        pixel_spacing = np.array(get_pixel_spacing(ds, idx), dtype=np.float64)
 
-    # Compute patient coordinates
-    patient_coords = image_position + pixel_x * pixel_spacing[0] * row_vector + pixel_y * pixel_spacing[1] * col_vector
+        row_vector = image_orientation[0]
+        col_vector = image_orientation[1]
 
-    return patient_coords
+        # pixel_x: (N,), pixel_y: (N,)
+        # result: (N, 3)
+
+        # We need to reshape pixel_x/y for broadcasting
+        px = pixel_x[:, np.newaxis]  # (N, 1)
+        py = pixel_y[:, np.newaxis]  # (N, 1)
+
+        patient_coords = image_position + px * pixel_spacing[0] * row_vector + py * pixel_spacing[1] * col_vector
+
+        if patient_coords.shape[0] == 1:
+            return patient_coords[0]
+        return patient_coords
+
+    else:
+        # Vectorized path using _extract_geometry
+        # We need geometry for all slices, then index with slice_index
+        origins, row_vectors, col_vectors, spacings = _extract_geometry(ds)
+
+        # slice_index might contain indices.
+        # Ensure integer
+        idxs = slice_index.astype(int)
+
+        # Select geometry
+        my_origins = origins[idxs]  # (N, 3)
+        my_rows = row_vectors[idxs]  # (N, 3)
+        my_cols = col_vectors[idxs]  # (N, 3)
+        my_spacings = spacings[idxs]  # (N, 2)
+
+        # Reshape for (N, 3) output
+        # px: (N, 1)
+        px = pixel_x
+        if px.ndim == 1:
+            px = px[:, np.newaxis]
+
+        py = pixel_y
+        if py.ndim == 1:
+            py = py[:, np.newaxis]
+
+        term1 = px * my_spacings[:, 0:1] * my_rows
+        term2 = py * my_spacings[:, 1:2] * my_cols
+
+        patient_coords = my_origins + term1 + term2
+
+        return patient_coords
+
+
+def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
+    """
+    Build the affine transformation matrix from voxel coordinates to patient coordinates.
+    Important: Assumes that the DICOM dataset represents a 3D volume and that 
+    the Slice Thickness, Spacing Between Slices and Image Orientation is constant across slices.
+    Also, it checks PerFrameFunctionalGroupsSequence to see if these Image Orientation and Position attributes are present and constant there.
+
+    Args:
+        ds (pydicom.Dataset): The DICOM dataset containing image metadata.
+
+    Returns:
+        np.ndarray: A (4x4) Transformation matrix similar to the one used in NIfTI files.
+
+    Raises:
+        ValueError: If required DICOM attributes are missing or have invalid format.
+        InconsistentDICOMFramesError: If frame geometry is inconsistent across slices.
+    """
+
+    def _as_vec3(x, name: str) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float64).reshape(-1)
+        if arr.size != 3:
+            raise ValueError(f"{name} must have 3 values, got {arr.size}")
+        return arr
+
+    def _as_iop6(x) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float64).reshape(-1)
+        if arr.size != 6:
+            raise ValueError(f"ImageOrientationPatient must have 6 values, got {arr.size}")
+        return arr
+
+    def _normed(v: np.ndarray, name: str) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        if not np.isfinite(n) or n == 0.0:
+            raise ValueError(f"{name} has zero/invalid norm")
+        return v / n
+
+    # Base (slice 0) geometry
+    pixel_spacing = np.asarray(get_pixel_spacing(ds, slice_index=0), dtype=np.float64).reshape(-1)
+    if pixel_spacing.size != 2:
+        raise ValueError(f"PixelSpacing must have 2 values, got {pixel_spacing.size}")
+
+    iop = _as_iop6(get_image_orientation(ds, slice_index=0))
+    row_dir = _normed(_as_vec3(iop[:3], "Row direction"), "Row direction")
+    col_dir = _normed(_as_vec3(iop[3:], "Column direction"), "Column direction")
+    # Slice direction: right-handed system in DICOM patient coordinates (LPS)
+    slice_dir = _normed(np.cross(row_dir, col_dir), "Slice direction")
+
+    origin = _as_vec3(get_image_position(ds, slice_index=0), "ImagePositionPatient")
+
+    # Determine slice spacing (mm). Prefer measuring from positions when possible.
+    n_frames = int(ds.get('NumberOfFrames', 1) or 1)
+
+    slice_spacing: float
+    if n_frames > 1:
+        p0 = origin
+        p1 = _as_vec3(get_image_position(ds, slice_index=1), "ImagePositionPatient")
+        diff01 = (p1 - p0).astype(np.float64)
+        proj01 = float(np.dot(diff01, slice_dir))
+        if not np.isfinite(proj01) or np.isclose(proj01, 0.0):
+            raise InconsistentDICOMFramesError(
+                "Cannot infer slice spacing from positions: adjacent frames have ~zero separation along slice normal")
+        slice_spacing = abs(proj01)
+    else:
+        slice_spacing = float(get_space_between_slices(ds))
+
+    # Consistency checks across frames (if multi-frame)
+    if n_frames > 1:
+        sample_indices = list(range(n_frames))
+
+        iop0 = iop
+        ps0 = pixel_spacing
+
+        # Check orientations + pixel spacing are constant
+        for idx in sample_indices:
+            iop_i = _as_iop6(get_image_orientation(ds, slice_index=int(idx)))
+            if not np.allclose(iop_i, iop0, atol=1e-4, rtol=0):
+                raise InconsistentDICOMFramesError(
+                    "ImageOrientationPatient varies across frames; cannot build a single affine")
+            ps_i = np.asarray(get_pixel_spacing(ds, slice_index=int(idx)), dtype=np.float64).reshape(-1)
+            if ps_i.size != 2 or not np.allclose(ps_i, ps0, atol=1e-6, rtol=0):
+                raise InconsistentDICOMFramesError("PixelSpacing varies across frames; cannot build a single affine")
+
+        # Check that frame positions advance consistently along the slice normal
+        # and are not oblique to the slice axis.
+        prev_pos = _as_vec3(get_image_position(ds, slice_index=0), "ImagePositionPatient")
+        step_projs: list[float] = []
+        for idx in sample_indices[1:]:
+            cur_pos = _as_vec3(get_image_position(ds, slice_index=int(idx)), "ImagePositionPatient")
+            diff = (cur_pos - prev_pos).astype(np.float64)
+            proj = float(np.dot(diff, slice_dir))
+            # Remove the component along slice_dir and ensure the remainder is small
+            residual = diff - proj * slice_dir
+            if np.linalg.norm(residual) > 1e-2:
+                raise InconsistentDICOMFramesError(
+                    "Frame positions are not consistent with a straight slice stack (position residual too large)")
+            step_projs.append(abs(proj))
+            prev_pos = cur_pos
+
+        # Spacing consistency: allow a little numeric tolerance (metadata often has rounding)
+        if step_projs and not np.allclose(step_projs, step_projs[0], atol=1e-3, rtol=0):
+            raise InconsistentDICOMFramesError(
+                f"Inferred slice spacing varies across frames; cannot build a single affine: {np.unique(step_projs)}")
+        if step_projs:
+            slice_spacing = float(step_projs[0])
+
+    # Build affine: consistent with pixel_to_patient() in this module.
+    # Voxel coords are interpreted as (pixel_x, pixel_y, slice_index).
+    # Note: PixelSpacing is [row_spacing, col_spacing] per DICOM.
+    col0 = row_dir * float(pixel_spacing[0])
+    col1 = col_dir * float(pixel_spacing[1])
+    col2 = slice_dir * float(slice_spacing)
+
+    affine = np.eye(4, dtype=np.float64)
+    affine[:3, 0] = col0
+    affine[:3, 1] = col1
+    affine[:3, 2] = col2
+    affine[:3, 3] = origin
+
+    return affine
+
+
+def patient_to_voxel(ds: pydicom.Dataset,
+                     patient_coords: np.ndarray) -> np.ndarray:
+    """
+    Convert patient coordinates (x, y, z) to voxel coordinates (pixel_x, pixel_y, slice_index).
+
+    This function handles variable slice geometry (e.g. gantry tilt, variable spacing) by checking
+    the position and orientation of every slice.
+
+    Args:
+        ds (pydicom.Dataset): The DICOM dataset containing image metadata.
+        patient_coords (np.ndarray): Patient coordinates (shape: (N, 3) or (3,)).
+
+    Returns:
+        np.ndarray: Voxel coordinates (shape: (N, 3) or (3,)).
+                    The coordinates are (pixel_x, pixel_y, slice_index).
+                    slice_index is returned as a float (nearest slice index).
+    """
+    # check input shape
+    if isinstance(patient_coords, (list, tuple)):
+        patient_coords = np.array(patient_coords, dtype=np.float64)
+    if (patient_coords.ndim == 1 and patient_coords.shape[0] != 3) or \
+       (patient_coords.ndim == 2 and patient_coords.shape[1] != 3) or \
+       (patient_coords.ndim > 2):
+        raise ValueError("patient_coords must have shape (3,) or (N, 3)")
+
+    is_single_point = patient_coords.ndim == 1
+    patient_coords = np.atleast_2d(patient_coords)  # (M, 3)
+
+    origins, row_vectors, col_vectors, spacings = _extract_geometry(ds)  # (N, 3), (N, 3), (N, 3), (N, 2)
+
+    # Calculate slice normals: row x col
+    slice_normals = np.cross(row_vectors, col_vectors)  # (N, 3)
+
+    # Normalize normals
+    norms = np.linalg.norm(slice_normals, axis=1, keepdims=True)
+    slice_normals = slice_normals / norms
+
+    # 1. Find slice coordinate (k)
+    # Calculate distance from each point to each slice plane
+    # (P - O) . n = P.n - O.n
+
+    dot_P_n = np.matmul(patient_coords, slice_normals.T)  # (M, N)
+    dot_O_n = np.sum(origins * slice_normals, axis=1)  # (N,)
+    dists = dot_P_n - dot_O_n[np.newaxis, :]  # (M, N)
+
+    # Find nearest slice
+    abs_dists = np.abs(dists)
+    k_indices = np.argmin(abs_dists, axis=1)  # (M,)
+
+    # 2. Find pixel coordinates (i, j) on the nearest slice
+    # Project point onto slice plane.
+    # i = (P - O_k) . row / spacing_x
+    # j = (P - O_k) . col / spacing_y
+
+    nearest_origins = origins[k_indices]  # (M, 3)
+    nearest_rows = row_vectors[k_indices]  # (M, 3)
+    nearest_cols = col_vectors[k_indices]  # (M, 3)
+    nearest_spacings = spacings[k_indices]  # (M, 2)
+
+    vec_PO = patient_coords - nearest_origins  # (M, 3)
+
+    i_coords = np.sum(vec_PO * nearest_rows, axis=1) / nearest_spacings[:, 0]
+    j_coords = np.sum(vec_PO * nearest_cols, axis=1) / nearest_spacings[:, 1]
+    k_coords = k_indices.astype(float)
+
+    voxel_coords = np.stack([i_coords, j_coords, k_coords], axis=1)
+
+    if is_single_point:
+        return voxel_coords[0]
+    return voxel_coords
 
 
 def _determine_anatomical_plane_from_text(ds: pydicom.Dataset) -> str:
@@ -1472,6 +1797,7 @@ def create_3d_dicom_viewer(dicom_list: Sequence[pydicom.Dataset] | Sequence[str]
     # Add image planes and orientation vectors
     for i, row in df.iterrows():
         pos = row['ImagePositionPatient']
+
         x_orient = row['x_orientation']
         y_orient = row['y_orientation']
         slice_norm = row['slice_orientation']
