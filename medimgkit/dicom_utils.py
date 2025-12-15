@@ -8,7 +8,8 @@ import pydicom.uid
 import pydicom.errors
 import pydicom.multival
 from pydicom.misc import is_dicom as pydicom_is_dicom
-from typing import Sequence, Generator, IO, TypeVar, Generic, Literal
+from typing import IO, TypeVar, Generic, Literal
+from collections.abc import Sequence, Generator
 import warnings
 from copy import deepcopy
 import logging
@@ -824,7 +825,7 @@ typically computed from Image Position (Patient) (0020,0032)
 """
 
 
-def get_space_between_slices(ds: pydicom.Dataset) -> float:
+def get_space_between_slices(ds: pydicom.Dataset, default=1.0) -> float:
     """
     Get the space between slices from a DICOM dataset.
 
@@ -846,7 +847,7 @@ def get_space_between_slices(ds: pydicom.Dataset) -> float:
     if 'SliceThickness' in ds:
         return ds.SliceThickness
 
-    return 1.0  # Default value if not found
+    return default # Default value if not found
 
 
 def get_image_orientation(ds: pydicom.Dataset, slice_index: int) -> np.ndarray:
@@ -1130,7 +1131,10 @@ def pixel_to_patient(ds: pydicom.Dataset,
         px = pixel_x[:, np.newaxis]  # (N, 1)
         py = pixel_y[:, np.newaxis]  # (N, 1)
 
-        patient_coords = image_position + px * pixel_spacing[0] * row_vector + py * pixel_spacing[1] * col_vector
+        # DICOM PixelSpacing is [row_spacing, col_spacing]
+        # - pixel_x is column index (moves along row_vector) -> uses col_spacing
+        # - pixel_y is row index (moves along col_vector) -> uses row_spacing
+        patient_coords = image_position + px * pixel_spacing[1] * row_vector + py * pixel_spacing[0] * col_vector
 
         if patient_coords.shape[0] == 1:
             return patient_coords[0]
@@ -1161,8 +1165,9 @@ def pixel_to_patient(ds: pydicom.Dataset,
         if py.ndim == 1:
             py = py[:, np.newaxis]
 
-        term1 = px * my_spacings[:, 0:1] * my_rows
-        term2 = py * my_spacings[:, 1:2] * my_cols
+        # DICOM PixelSpacing is [row_spacing, col_spacing]
+        term1 = px * my_spacings[:, 1:2] * my_rows
+        term2 = py * my_spacings[:, 0:1] * my_cols
 
         patient_coords = my_origins + term1 + term2
 
@@ -1210,6 +1215,10 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
     if pixel_spacing.size != 2:
         raise ValueError(f"PixelSpacing must have 2 values, got {pixel_spacing.size}")
 
+    # DICOM PixelSpacing is [row_spacing, col_spacing]
+    row_spacing = float(pixel_spacing[0])
+    col_spacing = float(pixel_spacing[1])
+
     iop = _as_iop6(get_image_orientation(ds, slice_index=0))
     row_dir = _normed(_as_vec3(iop[:3], "Row direction"), "Row direction")
     col_dir = _normed(_as_vec3(iop[3:], "Column direction"), "Column direction")
@@ -1219,7 +1228,7 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
     origin = _as_vec3(get_image_position(ds, slice_index=0), "ImagePositionPatient")
 
     # Determine slice spacing (mm). Prefer measuring from positions when possible.
-    n_frames = int(ds.get('NumberOfFrames', 1) or 1)
+    n_frames = int(get_number_of_slices(ds) or 1)
 
     slice_spacing: float
     if n_frames > 1:
@@ -1230,9 +1239,12 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
         if not np.isfinite(proj01) or np.isclose(proj01, 0.0):
             raise InconsistentDICOMFramesError(
                 "Cannot infer slice spacing from positions: adjacent frames have ~zero separation along slice normal")
-        slice_spacing = abs(proj01)
+        # Keep sign so the affine matches stored frame order.
+        slice_spacing = proj01
+        _LOGGER.debug(f"Inferred slice spacing from positions: {slice_spacing:.4f} mm")
     else:
-        slice_spacing = float(get_space_between_slices(ds))
+        slice_spacing = float(get_space_between_slices(ds, default=None))
+        _LOGGER.debug(f"Using SpacingBetweenSlices/SliceThickness for slice spacing: {slice_spacing} mm")
 
     # Consistency checks across frames (if multi-frame)
     if n_frames > 1:
@@ -1264,7 +1276,7 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
             if np.linalg.norm(residual) > 1e-2:
                 raise InconsistentDICOMFramesError(
                     "Frame positions are not consistent with a straight slice stack (position residual too large)")
-            step_projs.append(abs(proj))
+            step_projs.append(proj)
             prev_pos = cur_pos
 
         # Spacing consistency: allow a little numeric tolerance (metadata often has rounding)
@@ -1272,14 +1284,22 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
             raise InconsistentDICOMFramesError(
                 f"Inferred slice spacing varies across frames; cannot build a single affine: {np.unique(step_projs)}")
         if step_projs:
+            if slice_spacing:
+                if not np.isclose(slice_spacing, float(step_projs[0]), atol=1e-3, rtol=0):
+                    _LOGGER.warning(
+                        f"Slice spacing from SpacingBetweenSlices/SliceThickness ({slice_spacing:.4f} mm) "
+                        f"differs from inferred spacing from positions ({step_projs[0]:.4f} mm). "
+                        f"Using inferred spacing.")
             slice_spacing = float(step_projs[0])
+            _LOGGER.debug(f"Using inferred slice spacing from positions after consistency check: {slice_spacing:.4f} mm")
 
     # Build affine: consistent with pixel_to_patient() in this module.
     # Voxel coords are interpreted as (pixel_x, pixel_y, slice_index).
     # Note: PixelSpacing is [row_spacing, col_spacing] per DICOM.
-    col0 = row_dir * float(pixel_spacing[0])
-    col1 = col_dir * float(pixel_spacing[1])
+    col0 = row_dir * col_spacing
+    col1 = col_dir * row_spacing
     col2 = slice_dir * float(slice_spacing)
+    _LOGGER.debug(f"Affine columns:\n Col0 (X): {col0}\n Col1 (Y): {col1}\n Col2 (Z): {col2}\n Origin: {origin}")
 
     affine = np.eye(4, dtype=np.float64)
     affine[:3, 0] = col0
@@ -1932,3 +1952,58 @@ def create_3d_dicom_viewer(dicom_list: Sequence[pydicom.Dataset] | Sequence[str]
     )
 
     return fig
+
+
+def is_LPS_system(ds: pydicom.Dataset, slice_index: int = 0, atol: float = 1e-3) -> bool:
+    """
+    Check whether a DICOM dataset is (effectively) using the DICOM patient coordinate system (LPS).
+
+    Notes:
+      - Per the DICOM standard, patient coordinates are LPS. In practice, datasets can still be
+        malformed (non-orthonormal IOP, NaNs, etc.). This function therefore *validates* that
+        ImageOrientationPatient encodes a sane, right-handed patient basis.
+      - This is a heuristic/compliance check, not a proof against non-standard/private coordinate systems.
+
+    Args:
+        ds: pydicom Dataset.
+        slice_index: Frame index used to read ImageOrientationPatient for multi-frame objects.
+        atol: Absolute tolerance for orthogonality/normalization checks.
+
+    Returns:
+        True if ImageOrientationPatient appears DICOM/LPS-consistent, otherwise False.
+    """
+    try:
+        iop = np.asarray(get_image_orientation(ds, slice_index=slice_index), dtype=np.float64).reshape(-1)
+    except Exception:
+        return False
+
+    if iop.size != 6 or not np.all(np.isfinite(iop)):
+        return False
+
+    row = iop[:3]
+    col = iop[3:]
+
+    row_n = np.linalg.norm(row)
+    col_n = np.linalg.norm(col)
+    if not np.isfinite(row_n) or not np.isfinite(col_n) or row_n == 0.0 or col_n == 0.0:
+        return False
+
+    row_u = row / row_n
+    col_u = col / col_n
+
+    # Orthonormal-ish: unit length and nearly orthogonal
+    if not np.isclose(np.linalg.norm(row_u), 1.0, atol=atol):
+        return False
+    if not np.isclose(np.linalg.norm(col_u), 1.0, atol=atol):
+        return False
+    if abs(float(np.dot(row_u, col_u))) > atol:
+        return False
+
+    # Right-handed slice normal with non-zero magnitude
+    slc = np.cross(row_u, col_u)
+    slc_n = np.linalg.norm(slc)
+    if not np.isfinite(slc_n) or slc_n < (1.0 - 10 * atol):
+        return False
+
+    # At this point, the orientation is consistent with DICOM patient coords (LPS).
+    return True
