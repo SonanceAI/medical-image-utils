@@ -6,6 +6,7 @@ from pathlib import Path
 import nibabel as nib
 import gzip
 from medimgkit import GZIP_MIME_TYPES
+from typing import BinaryIO
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ def _read_slice_or_full(nibdata: SpatialImage,
     return nibdata.get_fdata()
 
 
-def read_nifti(file_path: str,
+def read_nifti(file_path: str | BinaryIO,
                mimetype: str | None = None,
                slice_index: int | None = None,
                slice_axis: int | None = None) -> tuple[np.ndarray, SpatialImage]:
@@ -61,8 +62,13 @@ def read_nifti(file_path: str,
         raise ValueError("slice_index must be provided if slice_axis is provided")
 
     try:
-        nibdata = nib.load(file_path)
-        imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+        if isinstance(file_path, (str, Path)):
+            nibdata = nib.load(file_path)
+            imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+        else:
+            with gzip.open(file_path, 'rb') as f:
+                nibdata = nib.Nifti1Image.from_stream(f)
+                imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
     except ImageFileError:
         if mimetype is None:
             raise
