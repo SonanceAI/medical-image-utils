@@ -101,7 +101,7 @@ def read_image(file_path: str | BinaryIO) -> np.ndarray:
     return imgs
 
 
-def read_array_normalized(file_path: str | BinaryIO,
+def read_array_normalized(file_path: str | BinaryIO | bytes,
                           index: int | None = None,
                           return_metainfo: bool = False,
                           use_magic=True) -> np.ndarray | tuple[np.ndarray, Any]:
@@ -123,6 +123,9 @@ def read_array_normalized(file_path: str | BinaryIO,
         raise FileNotFoundError(f"File not found: {file_path}")
 
     metainfo = None
+    if isinstance(file_path, bytes):
+        from io import BytesIO
+        file_path = BytesIO(file_path)
 
     try:
         mime_type, _ = guess_type(file_path, use_magic=use_magic)
