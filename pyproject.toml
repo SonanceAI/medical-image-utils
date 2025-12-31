@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medimgkit"
-version = "0.10.1"
+version = "0.11.0"
 description = "A comprehensive toolkit for medical image processing, including DICOM, NIfTI, and multi-format I/O utilities"
 readme = "README.md"
 license = "MIT"
@@ -36,7 +36,8 @@ dependencies = [
     'nbformat>=4.3.0',
     'pandas>=1.5.3',
     'pylibjpeg>=2.0.0',
-    'pylibjpeg-libjpeg>=2.0.0'
+    'pylibjpeg-libjpeg>=2.0.0',
+    'deprecated>=1.2.0'
 ]
 
 [project.optional-dependencies]

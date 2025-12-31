@@ -21,6 +21,7 @@ from collections import defaultdict, OrderedDict
 import uuid
 import hashlib
 from .io_utils import peek, is_io_object
+from deprecated import deprecated
 
 DICOM_EXTENSIONS = ['.dcm', '.dicom']
 
@@ -209,7 +210,7 @@ def to_bytesio(ds: pydicom.Dataset, name: str) -> BytesIO:
     dicom_bytes.mode = 'rb'
     return dicom_bytes
 
-
+@deprecated(reason='Use read_dicom_standardized instead.')
 def load_image_normalized(dicom: pydicom.Dataset, index: int = None) -> np.ndarray:
     """
     Normalizes the shape of an array of images to (n, c, y, x)=(#slices, #channels, height, width).
@@ -2007,3 +2008,156 @@ def is_LPS_system(ds: pydicom.Dataset, slice_index: int = 0, atol: float = 1e-3)
 
     # At this point, the orientation is consistent with DICOM patient coords (LPS).
     return True
+
+
+
+def read_dicom_standardized(
+    filepath: str | Path | pydicom.Dataset,
+    index: int | None = None,
+    convert_to_rgb: bool = True,
+    apply_modality_lut: bool = True,
+    apply_presentation_lut: bool = True,
+    normalize: bool = False
+) -> tuple[np.ndarray, pydicom.Dataset]:
+    """
+    Read a DICOM file and return pixel data in standardized (N, C, H, W) format.
+    DICOM Reader with Standardized Output Format.
+
+    This module provides functionality to read DICOM files and return pixel data
+    in a consistent (N, C, H, W) format, where:
+    - N: Number of frames/slices
+    - C: Number of channels (1 for grayscale, 3 for RGB)
+    - H: Height in pixels
+    - W: Width in pixels
+
+    The function handles various DICOM types including:
+    - Single-frame 2D images (CT, MR, X-ray, etc.)
+    - Multi-frame sequences (videos, temporal series)
+    - 3D volumes (stacks of slices)
+    - RGB/color images
+    - Different PhotometricInterpretations (MONOCHROME1, MONOCHROME2, RGB, YBR variants)
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the DICOM file
+    index : int or None, default=None
+        If specified, extract only the frame at this index from multi-frame DICOMs.
+        If None, extract all frames. Index is 0-based.
+    convert_to_rgb : bool, default=True
+        If True, convert YBR color spaces to RGB. Only affects color images.
+    apply_modality_lut : bool, default=False
+        If True, apply modality LUT transformation (e.g., to Hounsfield units for CT)
+    apply_presentation_lut : bool, default=True
+        If True, invert pixel values for MONOCHROME1 images (where low values should 
+        display as white). This ensures consistent interpretation where higher values 
+        are always brighter, regardless of the PhotometricInterpretation.
+    normalize : bool, default=False
+        If True, normalize pixel values to [0, 1] range
+    
+    Returns
+    -------
+    pixel_data : np.ndarray
+        Pixel data in (N, C, H, W) format:
+        - N: Number of frames/slices
+        - C: Number of channels (1 for grayscale, 3 for RGB)
+        - H: Height
+        - W: Width
+    dataset : pydicom.Dataset
+        The DICOM dataset object containing all metadata and tags
+    
+    Examples
+    --------
+    >>> # Read a 3d volume DICOM (e.g., CT scan)
+    >>> pixels, ds = read_dicom_standardized('ct_scan.dcm')
+    >>> print(pixels.shape)  # (120, 1, 512, 512)
+    >>> print(ds.Modality)  # 'CT'
+    
+    >>> # Read only the 5th frame from a multi-frame image
+    >>> pixels, ds = read_dicom_standardized('video.dcm', index=4)
+    >>> print(pixels.shape)  # (1, 3, 480, 640)
+    
+    >>> # Read all frames from a multi-frame RGB image
+    >>> pixels, ds = read_dicom_standardized('video.dcm')
+    >>> print(pixels.shape)  # (30, 3, 480, 640)
+    """
+    # Read DICOM file
+    if isinstance(filepath, (str, Path)):
+        ds = dcmread(filepath)
+    else:
+        ds = filepath
+    
+    # Get number of frames and validate index
+    
+    num_frames = int(ds.get('NumberOfFrames', 1))
+    if index is not None:
+        if index < 0 or index >= num_frames:
+            raise ValueError(f"Index {index} is out of bounds. The number of frames is {num_frames}.")
+        arr = pixel_array(ds, index=index, raw=not convert_to_rgb)
+        # Reset num_frames since we're only loading one frame
+        num_frames = 1
+    else:
+        arr = pixel_array(ds, raw=not convert_to_rgb)
+    
+    # Store the photometric interpretation before any modifications
+    photometric_interp = str(ds.get('PhotometricInterpretation', 'UNKNOWN'))
+    
+    # Apply modality LUT if requested (e.g., convert to Hounsfield units for CT)
+    if apply_modality_lut:
+        import pydicom.pixels.processing
+        arr = pydicom.pixels.processing.apply_modality_lut(arr, ds)
+    
+    # Apply presentation LUT: invert MONOCHROME1 images
+    # MONOCHROME1: low values should be displayed as white (inverted)
+    # MONOCHROME2: low values should be displayed as black (normal)
+    if apply_presentation_lut and photometric_interp == 'MONOCHROME1':
+        # Invert the pixel values
+        if np.issubdtype(arr.dtype, np.integer):
+            # For integer types, use max + min - value
+            arr = np.max(arr) + np.min(arr) - arr
+        else:
+            # For float types, use 1 - normalized values
+            arr_min, arr_max = arr.min(), arr.max()
+            if arr_max > arr_min:
+                arr = arr_max + arr_min - arr
+    
+    # Determine dimensions from DICOM tags
+    samples_per_pixel = int(ds.get('SamplesPerPixel', 1))
+    shape = arr.shape
+    
+    # Standardize to (N, C, H, W) format using robust shape disambiguation
+    if arr.ndim == 2:
+        # Single grayscale image: (H, W) -> (1, 1, H, W)
+        arr = arr.reshape((1, 1) + arr.shape)
+    elif arr.ndim == 3:
+        # Ambiguous case: could be (N, H, W) or (H, W, C)
+        # Use DICOM metadata to disambiguate
+        if shape[0] == 1 or (num_frames is not None and num_frames > 1):
+            # (N, H, W) -> (N, 1, H, W)
+            arr = arr.reshape(shape[0], 1, shape[1], shape[2])
+        elif shape[2] in (1, 3, 4) or (samples_per_pixel is not None and samples_per_pixel > 1):
+            # (H, W, C) -> (1, C, H, W)
+            arr = arr.transpose(2, 0, 1)
+            arr = arr.reshape(1, *arr.shape)
+        else:
+            # Default assumption: multi-frame grayscale (N, H, W)
+            arr = arr.reshape(shape[0], 1, shape[1], shape[2])
+    elif arr.ndim == 4:
+        # (N, H, W, C) -> (N, C, H, W)
+        if shape[3] == samples_per_pixel or shape[3] in (1, 3, 4) or (samples_per_pixel is not None and samples_per_pixel > 1):
+            arr = arr.transpose(0, 3, 1, 2)
+        else:
+            raise ValueError(f"Unsupported 4D shape: {shape} with SamplesPerPixel: {samples_per_pixel}")
+    else:
+        raise ValueError(f"Unsupported array shape: {shape} (ndim={arr.ndim})")
+    
+    # Normalize if requested
+    if normalize:
+        arr = arr.astype(np.float32)
+        min_val = arr.min()
+        max_val = arr.max()
+        if max_val > min_val:
+            arr = (arr - min_val) / (max_val - min_val)
+    
+    return arr, ds
+

@@ -29,17 +29,33 @@ import cv2
 import numpy as np
 from PIL import Image
 import logging
+import tempfile
+import shutil
 from .nifti_utils import read_nifti, NIFTI_MIMES
-from .dicom_utils import load_image_normalized as read_dicom
+from .dicom_utils import read_dicom_standardized as read_dicom
 from .format_detection import guess_type, GZIP_MIME_TYPES
-from typing import Any
+from typing import Any, BinaryIO
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def read_video(file_path: str, index: int | None = None) -> np.ndarray:
-    cap = cv2.VideoCapture(file_path)
+def read_video(file_path: str | BinaryIO, index: int | None = None) -> np.ndarray:
+    is_path = isinstance(file_path, (str, os.PathLike))
+    temp_path = None
+    video_source = file_path
+
+    if not is_path:
+        # Create a temporary file to read the video from stream
+        fd, temp_path = tempfile.mkstemp(suffix='.mp4')
+        with os.fdopen(fd, 'wb') as f:
+            file_path.seek(0)
+            shutil.copyfileobj(file_path, f)
+        video_source = temp_path
+
+    cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         raise ValueError(f"Failed to open video file: {file_path}")
     try:
         if index is None:
@@ -65,6 +81,8 @@ def read_video(file_path: str, index: int | None = None) -> np.ndarray:
             imgs = frame.transpose(2, 0, 1)
     finally:
         cap.release()
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
     if imgs is None or len(imgs) == 0:
         raise ValueError(f"No frames found in video file: {file_path}")
@@ -72,7 +90,7 @@ def read_video(file_path: str, index: int | None = None) -> np.ndarray:
     return imgs
 
 
-def read_image(file_path: str) -> np.ndarray:
+def read_image(file_path: str | BinaryIO) -> np.ndarray:
     with Image.open(file_path) as pilimg:
         imgs = np.array(pilimg)
     if imgs.ndim == 2:  # (H, W)
@@ -83,7 +101,7 @@ def read_image(file_path: str) -> np.ndarray:
     return imgs
 
 
-def read_array_normalized(file_path: str,
+def read_array_normalized(file_path: str | BinaryIO,
                           index: int | None = None,
                           return_metainfo: bool = False,
                           use_magic=True) -> np.ndarray | tuple[np.ndarray, Any]:
@@ -91,7 +109,7 @@ def read_array_normalized(file_path: str,
     Read an array from a file.
 
     Args:
-        file_path: The path to the file.
+        file_path: The path to the file or a file-like object.
         index: If specified, read only the frame at this index (0-based).
             If None, read all frames.
         Supported file formats are NIfTI (.nii, .nii.gz), PNG (.png), JPEG (.jpg, .jpeg) and npy (.npy).
@@ -100,7 +118,8 @@ def read_array_normalized(file_path: str,
         The array read from the file in shape (#frames, C, H, W), if `index=None`,
             or (C, H, W) if `index` is specified.
     """
-    if not os.path.exists(file_path):
+    is_path = isinstance(file_path, (str, os.PathLike))
+    if is_path and not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
     metainfo = None
@@ -112,11 +131,14 @@ def read_array_normalized(file_path: str,
             raise ValueError(f"Could not determine MIME type for file: {file_path}")
 
         if mime_type.split('/')[-1] == 'dicom':
+            if not is_path:
+                file_path.seek(0)
             ds = pydicom.dcmread(file_path)
             if index is not None:
-                imgs = read_dicom(ds, index=index)[0]
+                imgs, _ = read_dicom(ds, index=index)
+                imgs = imgs[0]
             else:
-                imgs = read_dicom(ds)
+                imgs, _ = read_dicom(ds)
             # Free up memory
             if hasattr(ds, '_pixel_array'):
                 ds._pixel_array = None
@@ -124,6 +146,8 @@ def read_array_normalized(file_path: str,
                 ds.PixelData = None
             metainfo = ds
         elif mime_type.endswith('nifti') or mime_type in GZIP_MIME_TYPES:
+            if not is_path:
+                file_path.seek(0)
             imgs, nibmetainfo = read_nifti(file_path,
                                            mimetype=mime_type,
                                            slice_index=index,
@@ -131,14 +155,14 @@ def read_array_normalized(file_path: str,
             # For NIfTI files, try to load associated JSON metadata
             if return_metainfo:
                 metainfo = nibmetainfo
-                if file_path.endswith('.nii.gz'):
-                    json_path = file_path[:-7] + '.json'
-                elif file_path.endswith('.nii'):
-                    json_path = file_path[:-4] + '.json'
-                elif file_path.endswith('.gz'):
-                    json_path = file_path[:-3] + '.json'
-                else:
-                    json_path = None
+                json_path = None
+                if is_path:
+                    if file_path.endswith('.nii.gz'):
+                        json_path = file_path[:-7] + '.json'
+                    elif file_path.endswith('.nii'):
+                        json_path = file_path[:-4] + '.json'
+                    elif file_path.endswith('.gz'):
+                        json_path = file_path[:-3] + '.json'
 
                 if json_path and os.path.exists(json_path):
                     try:
@@ -155,6 +179,8 @@ def read_array_normalized(file_path: str,
             elif mime_type.startswith('image/'):
                 imgs = read_image(file_path)
             elif mime_type == 'application/x-numpy-data':
+                if not is_path:
+                    file_path.seek(0)
                 imgs = np.load(file_path)
                 # if is an NpzFile, convert to array
                 if isinstance(imgs, np.lib.npyio.NpzFile):
