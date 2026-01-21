@@ -34,7 +34,7 @@ import shutil
 from .nifti_utils import read_nifti, NIFTI_MIMES
 from .dicom_utils import read_dicom_standardized as read_dicom
 from .format_detection import guess_type, GZIP_MIME_TYPES
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, overload, Literal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -99,6 +99,21 @@ def read_image(file_path: str | BinaryIO) -> np.ndarray:
         imgs = imgs.transpose(2, 0, 1)[np.newaxis]  # (H, W, C) -> (1, C, H, W)
 
     return imgs
+
+
+@overload
+def read_array_normalized(file_path: str | BinaryIO | bytes,
+                          index: int | None = None,
+                          return_metainfo: Literal[False] = False,
+                          use_magic=True) -> np.ndarray: ...
+
+
+@overload
+def read_array_normalized(file_path: str | BinaryIO | bytes,
+                          index: int | None = None,
+                          *,
+                          return_metainfo: Literal[True],
+                          use_magic=True) -> tuple[np.ndarray, Any]: ...
 
 
 def read_array_normalized(file_path: str | BinaryIO | bytes,
