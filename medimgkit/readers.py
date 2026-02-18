@@ -105,7 +105,9 @@ def read_image(file_path: str | BinaryIO) -> np.ndarray:
 def read_array_normalized(file_path: str | BinaryIO | bytes,
                           index: int | None = None,
                           return_metainfo: Literal[False] = False,
-                          use_magic=True) -> np.ndarray: ...
+                          use_magic=True,
+                          mime_type: str | None = None
+                          ) -> np.ndarray: ...
 
 
 @overload
@@ -113,13 +115,17 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
                           index: int | None = None,
                           *,
                           return_metainfo: Literal[True],
-                          use_magic=True) -> tuple[np.ndarray, Any]: ...
+                          use_magic=True,
+                          mime_type: str | None = None
+                          ) -> tuple[np.ndarray, Any]: ...
 
 
 def read_array_normalized(file_path: str | BinaryIO | bytes,
                           index: int | None = None,
                           return_metainfo: bool = False,
-                          use_magic=True) -> np.ndarray | tuple[np.ndarray, Any]:
+                          use_magic=True,
+                          mime_type: str | None = None
+                          ) -> np.ndarray | tuple[np.ndarray, Any]:
     """
     Read an array from a file.
 
@@ -143,10 +149,13 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
         file_path = BytesIO(file_path)
 
     try:
-        mime_type, _ = guess_type(file_path, use_magic=use_magic)
-        _LOGGER.debug(f"Detected MIME type: {mime_type}")
         if mime_type is None:
-            raise ValueError(f"Could not determine MIME type for file: {file_path}")
+            mime_type, _ = guess_type(file_path, use_magic=use_magic)
+            _LOGGER.debug(f"Detected MIME type: {mime_type}")
+            if mime_type is None:
+                raise ValueError(f"Could not determine MIME type for file: {file_path}")
+        else:
+            mime_type = mime_type.lower()
 
         if mime_type.split('/')[-1] == 'dicom':
             if not is_path:
