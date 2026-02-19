@@ -6,17 +6,17 @@ from pathlib import Path
 import nibabel as nib
 import gzip
 from medimgkit import GZIP_MIME_TYPES
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NIFTI_MIME = 'application/nifti'
 NIFTI_MIMES = ['application/x-nifti', 'image/x.nifti', 'application/nifti']
 NIFTI_EXTENSIONS = ('.nii', '.hdr')
-_AXIS_MAPPING = {
-    'sagittal': 0,
-    'coronal': 1,
-    'axial': 2
+_PLANES_TO_CODES = {
+    "sagittal": {'L', 'R'},
+    "coronal": {'A', 'P'},
+    "axial": {'I', 'S'}
 }
 
 
@@ -257,7 +257,6 @@ def is_nifti_file(file_path: Path | str) -> bool:
     # Check magic number
     try:
         import magic
-        import gzip
         file_type = magic.from_file(str(file_path), mime=True)
         if file_type in NIFTI_MIMES:
             return True
@@ -309,29 +308,44 @@ def check_nifti_magic_numbers(data: bytes) -> bool:
     return False
 
 
-def axis_name_to_axis_index(data: SpatialImage,
-                            axis_name: str) -> int:
+def get_plane_axis(data: SpatialImage,
+                   plane: Literal['axial', 'sagittal', 'coronal']) -> int:
     """
-    Convert an axis name to its corresponding index in the NIfTI image.
-    ASSUMES data indices are aligned with the axis.
+    Maps an anatomical plane ('axial', 'sagittal', 'coronal') to its 
+    corresponding axis index (0, 1, or 2) in the get_fdata() numpy array.
 
     Args:
         data (SpatialImage): The NIfTI image data.
-        axis_name (str): The name of the axis ('sagittal', 'coronal', 'axial').
+        plane (str): The anatomical plane to map ('axial', 'sagittal', 'coronal').
 
     Returns:
-        int: The index of the axis (0, 1, or 2).
+        int: The axis index corresponding to the specified plane (0, 1, or 2).
+
     """
-    rotation_matrix = data.affine[:3, :3]
-    axis_name = axis_name.lower()
-    idx = _AXIS_MAPPING.get(axis_name)
-    if idx is None:
-        raise ValueError(f"Unknown axis name: {axis_name}. Expected one of {set(_AXIS_MAPPING.keys())}.")
-    axis_index = np.argmax(np.abs(rotation_matrix[:, idx]))
-    return axis_index
+    valid_planes = {"axial", "sagittal", "coronal"}
+
+    if plane not in valid_planes:
+        raise ValueError(f"Invalid plane '{plane}'. Must be one of {valid_planes}.")
+
+    # Extract the orientation codes (e.g., ('R', 'A', 'S'))
+    axcodes = nib.orientations.aff2axcodes(data.affine)
+
+    # Sagittal slices move along the Left/Right (X) axis
+    # Coronal slices move along the Anterior/Posterior (Y) axis
+    # Axial slices move along the Inferior/Superior (Z) axis
+    target_codes = _PLANES_TO_CODES[plane]
+
+    for axis_index, code in enumerate(axcodes):
+        if code in target_codes:
+            return axis_index
+
+    raise RuntimeError(f"Could not map the {plane} plane from affine codes: {axcodes}")
 
 
-def get_nifti_shape(file_path: str) -> tuple:
+axis_name_to_axis_index = get_plane_axis  # alias for backward compatibility
+
+
+def get_nifti_shape(file_path: str) -> tuple[int, ...]:
     """
     Get the shape of a NIfTI file.
 
@@ -339,7 +353,7 @@ def get_nifti_shape(file_path: str) -> tuple:
         file_path (str): Path to the NIfTI file (.nii or .nii.gz)
 
     Returns:
-        tuple: Shape of the NIfTI image (X, Y, Z)
+        tuple[int, ...]: Shape of the NIfTI image (X, Y, Z)
     """
     try:
         return nib.load(file_path).shape

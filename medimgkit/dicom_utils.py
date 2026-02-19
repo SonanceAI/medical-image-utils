@@ -88,6 +88,57 @@ class TokenMapper:
 _TOKEN_MAPPER = TokenMapper()
 
 
+_MODALITY_THRESHOLDS = {
+    'CT': 10.0,
+    'PT': 10.0,
+    'NM': 10.0,
+    'MR': 20.0,
+    'XA': 25.0,
+    'US': 42.0
+}
+
+
+def get_oblique_threshold(ds: pydicom.Dataset | str,
+                          default_threshold: float = 15.0) -> float:
+    """
+    Computes a prudent threshold in degrees for determining if a DICOM image 
+    is 'too oblique', based on Modality, Anatomy, and Image Type.
+
+    Returns None if the concept of 3D obliquity does not apply to the image.
+    """
+    # 1. Modality Baseline
+    if isinstance(ds, str):
+        return _MODALITY_THRESHOLDS.get(ds, default_threshold)
+    else:
+        modality = ds.get('Modality', 'UNKNOWN')
+
+    # 2D projection modalities don't have a 3D slice plane
+    if modality in ['CR', 'DX', 'MG', 'PX']:
+        return default_threshold
+
+    # Start with the modality baseline, fallback to the default if unknown
+    threshold = _MODALITY_THRESHOLDS.get(modality, default_threshold)
+
+    # 2. Anatomy Context (Body Part Examined)
+    body_part = str(ds.get('BodyPartExamined', '')).upper()
+
+    # These anatomies are routinely acquired in heavily oblique planes.
+    # A strict threshold would falsely flag standard clinical acquisitions.
+    natively_oblique_parts = ['HEART', 'CARDIAC', 'KNEE', 'SHOULDER', 'ANKLE', 'WRIST']
+
+    if modality == 'MR' and any(part in body_part for part in natively_oblique_parts):
+        threshold += 5
+
+    image_type_values = ds.get('ImageType', [])
+    image_type_str = [str(val).upper() for val in image_type_values]
+
+    if 'MPR' in image_type_str or 'REFORMATTED' in image_type_str:
+        # MPRs are arbitrarily angled by design. A strict threshold is not prudent.
+        threshold += 5
+
+    return threshold
+
+
 def anonymize_dicom(ds: pydicom.Dataset,
                     retain_codes: Sequence[tuple] = [],
                     copy=False,
@@ -209,6 +260,7 @@ def to_bytesio(ds: pydicom.Dataset, name: str) -> BytesIO:
     dicom_bytes.name = name
     dicom_bytes.mode = 'rb'
     return dicom_bytes
+
 
 @deprecated(reason='Use read_dicom_standardized instead.')
 def load_image_normalized(dicom: pydicom.Dataset, index: int = None) -> np.ndarray:
@@ -848,7 +900,7 @@ def get_space_between_slices(ds: pydicom.Dataset, default=1.0) -> float:
     if 'SliceThickness' in ds:
         return ds.SliceThickness
 
-    return default # Default value if not found
+    return default  # Default value if not found
 
 
 def get_image_orientation(ds: pydicom.Dataset, slice_index: int) -> np.ndarray:
@@ -1292,7 +1344,8 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
                         f"differs from inferred spacing from positions ({step_projs[0]:.4f} mm). "
                         f"Using inferred spacing.")
             slice_spacing = float(step_projs[0])
-            _LOGGER.debug(f"Using inferred slice spacing from positions after consistency check: {slice_spacing:.4f} mm")
+            _LOGGER.debug(
+                f"Using inferred slice spacing from positions after consistency check: {slice_spacing:.4f} mm")
 
     # Build affine: consistent with pixel_to_patient() in this module.
     # Voxel coords are interpreted as (pixel_x, pixel_y, slice_index).
@@ -1396,7 +1449,7 @@ def _determine_anatomical_plane_from_text(ds: pydicom.Dataset) -> str:
 
 def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
                                           slice_axis: int | None = None,
-                                          alignment_threshold: float = 15,
+                                          alignment_threshold: float | None = None,
                                           fallback_for_text: bool = False) -> str:
     """
     Determine the anatomical plane of a DICOM slice (Axial, Sagittal, Coronal, Oblique, or Unknown).
@@ -1404,8 +1457,8 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
     Args:
         ds (pydicom.Dataset): The DICOM dataset containing the image metadata.
         slice_axis (int|None): The axis of the slice to analyze (0, 1, or 2). Unnecessary if is a 2d image.
-        alignment_threshold (float): Threshold for considering alignment with anatomical axes in degrees.
-            Values above this threshold are considered "Oblique".
+        alignment_threshold (float|None): Threshold for considering alignment with anatomical axes in degrees.
+            Values above this threshold are considered "Oblique". If None, uses `get_oblique_threshold(ds)`.
         fallback_for_text (bool): If True, use SeriesDescription and ProtocolName to infer plane if orientation data is missing.
 
     Returns:
@@ -1414,6 +1467,8 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
     Raises:
         ValueError: If `slice_axis` is not 0, 1, or 2.
     """
+    if alignment_threshold is None:
+        alignment_threshold = get_oblique_threshold(ds)
     # the first axis is the frame axis
     if ds.get('NumberOfFrames', 1) != 1:
         if slice_axis is None:
@@ -1490,7 +1545,7 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
 
     Returns:
         str: The name of the anatomical plane ('Axial', 'Sagittal', 'Coronal', 'Oblique', or 'Unknown').
-        float: The maximum dot product with the anatomical axes.
+        float: The angle in degrees between the axis vector and the closest anatomical axis.
     """
     # convert all to positive
     axis_vector = np.abs(axis_vector)
@@ -1520,6 +1575,66 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
     else:
         # _LOGGER.debug(f"Anatomical plane for {axis_vector} is oblique with {degrees:.2f} degrees off {name}")
         return "Oblique", degrees
+
+
+def get_plane_axis(ds: pydicom.Dataset,
+                   plane: Literal['axial', 'sagittal', 'coronal'],
+                   alignment_threshold: float | None = None) -> int | None:
+    """
+    Return the pixel-array axis index (0, 1, or 2) that corresponds to the
+    requested anatomical plane for the given DICOM dataset.
+
+    Axis semantics match those used by ``determine_anatomical_plane_from_dicom``:
+    - 0 → slice/frame axis  (``ds.pixel_array[i, :, :]``)
+    - 1 → row axis          (``ds.pixel_array[:, i, :]``)
+    - 2 → column axis       (``ds.pixel_array[:, :, i]``)
+
+    Args:
+        ds: DICOM dataset containing image metadata.
+        plane: Target anatomical plane – one of ``'axial'``, ``'sagittal'``, or
+            ``'coronal'`` (case-insensitive).
+        alignment_threshold: Maximum angle (degrees) allowed between the axis
+            vector and the canonical anatomical direction before it is considered
+            oblique. If None, uses ``get_oblique_threshold(ds)``.
+
+    Returns:
+        The axis index (0, 1, or 2) whose orientation matches *plane*, or
+        ``None`` when the no axis aligns with the requested plane within *alignment_threshold*.
+
+    """
+    if alignment_threshold is None:
+        alignment_threshold = get_oblique_threshold(ds)
+    plane_norm = plane.lower()
+    if plane_norm not in ('axial', 'sagittal', 'coronal'):
+        raise ValueError(f"plane must be 'axial', 'sagittal', or 'coronal', got {plane!r}")
+
+    target = plane_norm.capitalize()  # 'Axial' | 'Sagittal' | 'Coronal'
+
+    iop = np.array(get_image_orientation(ds, slice_index=0), dtype=np.float64)
+
+    if iop.size != 6:
+        raise ValueError(f"ImageOrientationPatient must have 6 values, got {iop.size}")
+
+    row_dir = iop[:3]
+    col_dir = iop[3:]
+    normal = np.cross(row_dir, col_dir)
+
+    # axis index → direction vector
+    axis_vectors: list[tuple[int, np.ndarray]] = [
+        (0, normal),   # slice / frame direction
+        (1, row_dir),  # row direction
+        (2, col_dir),  # column direction
+    ]
+
+    for axis_idx, vec in axis_vectors:
+        plane_name, degs = determine_anatomical_plane(vec, alignment_threshold)
+        if plane_name == target:
+            return axis_idx
+
+    return None
+
+
+axis_name_to_axis_index = get_plane_axis
 
 
 def convert_slice_location_to_slice_index_from_dicom(ds: pydicom.Dataset,
@@ -2010,7 +2125,6 @@ def is_LPS_system(ds: pydicom.Dataset, slice_index: int = 0, atol: float = 1e-3)
     return True
 
 
-
 def read_dicom_standardized(
     filepath: str | Path | pydicom.Dataset,
     index: int | None = None,
@@ -2054,7 +2168,7 @@ def read_dicom_standardized(
         are always brighter, regardless of the PhotometricInterpretation.
     normalize : bool, default=False
         If True, normalize pixel values to [0, 1] range
-    
+
     Returns
     -------
     pixel_data : np.ndarray
@@ -2065,18 +2179,18 @@ def read_dicom_standardized(
         - W: Width
     dataset : pydicom.Dataset
         The DICOM dataset object containing all metadata and tags
-    
+
     Examples
     --------
     >>> # Read a 3d volume DICOM (e.g., CT scan)
     >>> pixels, ds = read_dicom_standardized('ct_scan.dcm')
     >>> print(pixels.shape)  # (120, 1, 512, 512)
     >>> print(ds.Modality)  # 'CT'
-    
+
     >>> # Read only the 5th frame from a multi-frame image
     >>> pixels, ds = read_dicom_standardized('video.dcm', index=4)
     >>> print(pixels.shape)  # (1, 3, 480, 640)
-    
+
     >>> # Read all frames from a multi-frame RGB image
     >>> pixels, ds = read_dicom_standardized('video.dcm')
     >>> print(pixels.shape)  # (30, 3, 480, 640)
@@ -2086,9 +2200,9 @@ def read_dicom_standardized(
         ds = dcmread(filepath)
     else:
         ds = filepath
-    
+
     # Get number of frames and validate index
-    
+
     num_frames = int(ds.get('NumberOfFrames', 1))
     if index is not None:
         if index < 0 or index >= num_frames:
@@ -2098,15 +2212,15 @@ def read_dicom_standardized(
         num_frames = 1
     else:
         arr = pixel_array(ds, raw=not convert_to_rgb)
-    
+
     # Store the photometric interpretation before any modifications
     photometric_interp = str(ds.get('PhotometricInterpretation', 'UNKNOWN'))
-    
+
     # Apply modality LUT if requested (e.g., convert to Hounsfield units for CT)
     if apply_modality_lut:
         import pydicom.pixels.processing
         arr = pydicom.pixels.processing.apply_modality_lut(arr, ds)
-    
+
     # Apply presentation LUT: invert MONOCHROME1 images
     # MONOCHROME1: low values should be displayed as white (inverted)
     # MONOCHROME2: low values should be displayed as black (normal)
@@ -2120,11 +2234,11 @@ def read_dicom_standardized(
             arr_min, arr_max = arr.min(), arr.max()
             if arr_max > arr_min:
                 arr = arr_max + arr_min - arr
-    
+
     # Determine dimensions from DICOM tags
     samples_per_pixel = int(ds.get('SamplesPerPixel', 1))
     shape = arr.shape
-    
+
     # Standardize to (N, C, H, W) format using robust shape disambiguation
     if arr.ndim == 2:
         # Single grayscale image: (H, W) -> (1, 1, H, W)
@@ -2150,7 +2264,7 @@ def read_dicom_standardized(
             raise ValueError(f"Unsupported 4D shape: {shape} with SamplesPerPixel: {samples_per_pixel}")
     else:
         raise ValueError(f"Unsupported array shape: {shape} (ndim={arr.ndim})")
-    
+
     # Normalize if requested
     if normalize:
         arr = arr.astype(np.float32)
@@ -2158,6 +2272,5 @@ def read_dicom_standardized(
         max_val = arr.max()
         if max_val > min_val:
             arr = (arr - min_val) / (max_val - min_val)
-    
-    return arr, ds
 
+    return arr, ds
