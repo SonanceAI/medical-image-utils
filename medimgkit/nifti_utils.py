@@ -345,6 +345,29 @@ def get_plane_axis(data: SpatialImage,
 axis_name_to_axis_index = get_plane_axis  # alias for backward compatibility
 
 
+def get_dim_size(data: SpatialImage | str | Path, axis_index: int) -> int:
+    """
+    Get the size of a specific dimension (axis) from a NIfTI image.
+
+    Reads only the header — voxel data is never loaded into memory.
+
+    Args:
+        data (SpatialImage | str | Path): The NIfTI image or path to one.
+        axis_index (int): Index of the axis.
+
+    Returns:
+        int: Size of the specified dimension.
+    """
+    if axis_index > 4:
+        raise ValueError(f"Invalid axis_index {axis_index}. Must be between 0 and 4.")
+    if isinstance(data, (str, Path)):
+        # nib.load() is lazy — only the header is read, no voxel data loaded
+        shape = nib.load(data).header.get_data_shape()
+    else:
+        shape = data.shape
+    return int(shape[axis_index])
+
+
 def get_nifti_shape(file_path: str) -> tuple[int, ...]:
     """
     Get the shape of a NIfTI file.

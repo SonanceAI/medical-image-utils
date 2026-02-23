@@ -1610,7 +1610,13 @@ def get_plane_axis(ds: pydicom.Dataset,
 
     target = plane_norm.capitalize()  # 'Axial' | 'Sagittal' | 'Coronal'
 
-    iop = np.array(get_image_orientation(ds, slice_index=0), dtype=np.float64)
+    try:
+        iop = np.array(get_image_orientation(ds, slice_index=0), dtype=np.float64)
+    except ValueError:
+        _LOGGER.warning("ImageOrientationPatient missing or invalid in DICOM dataset."
+                        " Assuming standard orientation (Axial: row=[1,0,0], col=[0,1,0]).")
+        # assume standard orientation if missing (Axial: row=[1,0,0], col=[0,1,0])
+        iop = np.array([1, 0, 0, 0, 1, 0], dtype=np.float64)
 
     if iop.size != 6:
         raise ValueError(f"ImageOrientationPatient must have 6 values, got {iop.size}")
@@ -1632,6 +1638,25 @@ def get_plane_axis(ds: pydicom.Dataset,
             return axis_idx
 
     return None
+
+
+def get_dim_size(ds: pydicom.Dataset,
+                 axis_index: int) -> int:
+    """Get the size of a specific dimension (axis) from a DICOM dataset.
+    Parameters:
+        ds (pydicom.Dataset): The DICOM dataset containing image metadata.
+        axis_index (int): Index of the axis
+    Returns:
+        int: Size of the specified dimension (axis).
+    """
+    if axis_index == 0:
+        return get_number_of_slices(ds)
+    elif axis_index == 1:
+        return int(ds.Rows)
+    elif axis_index == 2:
+        return int(ds.Columns)
+    else:
+        raise ValueError(f"Invalid axis_index {axis_index}. Must be 0, 1, or 2.")
 
 
 axis_name_to_axis_index = get_plane_axis
