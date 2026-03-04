@@ -22,6 +22,7 @@ import uuid
 import hashlib
 from .io_utils import peek, is_io_object
 from deprecated import deprecated
+from medimgkit import ViewPlane
 
 DICOM_EXTENSIONS = ['.dcm', '.dicom']
 
@@ -572,12 +573,11 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     Returns:
         A generator that yields the merged DICOM files.
     """
-    from tqdm.auto import tqdm
-
     dicoms_map = defaultdict(list)
     dicom_list = []
 
     if progress_bar:
+        from tqdm.auto import tqdm
         iterable = tqdm(files_path, desc="Reading DICOMs metadata", unit="file")
     else:
         iterable = files_path
@@ -1578,7 +1578,7 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
 
 
 def get_plane_axis(ds: pydicom.Dataset,
-                   plane: Literal['axial', 'sagittal', 'coronal'],
+                   plane: ViewPlane,
                    alignment_threshold: float | None = None) -> int | None:
     """
     Return the pixel-array axis index (0, 1, or 2) that corresponds to the
@@ -1639,16 +1639,43 @@ def get_plane_axis(ds: pydicom.Dataset,
 
     return None
 
+def rawplaneaxis2stdplaneaxis_idx(axis_idx: int) -> int:
+    """
+    Convert raw plane axis index (0, 1, 2) to standard anatomical plane axis index.
+    implemented for working with the result of read_dicom_standardized.
+
+    Raw volume axes:   (N=0, H=1, W=2)
+    Standardized axes: (N=0, C=1, H=2, W=3)
+
+    The channel dimension C is inserted at position 1, shifting H and W by 1.
+
+    Args:
+        axis_idx: Raw axis index (0, 1, or 2).
+
+    Returns:
+        Corresponding axis index in the standardized (N, C, H, W) array.
+    """
+    if axis_idx == 0:
+        return 0
+    elif axis_idx in (1, 2):
+        return axis_idx + 1
+    else:
+        raise ValueError(f"Invalid raw axis index {axis_idx}. Must be 0, 1, or 2.")
+
 
 def get_dim_size(ds: pydicom.Dataset,
-                 axis_index: int) -> int:
+                 axis_index: int | ViewPlane) -> int:
     """Get the size of a specific dimension (axis) from a DICOM dataset.
     Parameters:
         ds (pydicom.Dataset): The DICOM dataset containing image metadata.
-        axis_index (int): Index of the axis
+        axis_index (int | ViewPlane): Index of the axis or anatomical plane name ('axial', 'sagittal', 'coronal')
     Returns:
         int: Size of the specified dimension (axis).
     """
+    if isinstance(axis_index, str):
+        if axis_index := get_plane_axis(ds, axis_index) is None:
+            raise ValueError(f"Could not determine axis index for plane '{axis_index}' in DICOM dataset.")
+
     if axis_index == 0:
         return get_number_of_slices(ds)
     elif axis_index == 1:
@@ -2260,17 +2287,36 @@ def read_dicom_standardized(
             if arr_max > arr_min:
                 arr = arr_max + arr_min - arr
 
+    # Standardize to (N, C, H, W) format using robust shape disambiguation
+    arr = standardize_array_shape(ds, arr=arr)
+
+    # Normalize if requested
+    if normalize:
+        arr = arr.astype(np.float32)
+        min_val = arr.min()
+        max_val = arr.max()
+        if max_val > min_val:
+            arr = (arr - min_val) / (max_val - min_val)
+
+    return arr, ds
+
+
+def standardize_array_shape(ds: pydicom.Dataset,
+                            arr: np.ndarray | None = None) -> np.ndarray:
+    if arr is None:
+        arr = ds.pixel_array
+
     # Determine dimensions from DICOM tags
     samples_per_pixel = int(ds.get('SamplesPerPixel', 1))
     shape = arr.shape
 
-    # Standardize to (N, C, H, W) format using robust shape disambiguation
     if arr.ndim == 2:
         # Single grayscale image: (H, W) -> (1, 1, H, W)
         arr = arr.reshape((1, 1) + arr.shape)
     elif arr.ndim == 3:
         # Ambiguous case: could be (N, H, W) or (H, W, C)
         # Use DICOM metadata to disambiguate
+        num_frames = int(ds.get('NumberOfFrames', 1))
         if shape[0] == 1 or (num_frames is not None and num_frames > 1):
             # (N, H, W) -> (N, 1, H, W)
             arr = arr.reshape(shape[0], 1, shape[1], shape[2])
@@ -2290,12 +2336,4 @@ def read_dicom_standardized(
     else:
         raise ValueError(f"Unsupported array shape: {shape} (ndim={arr.ndim})")
 
-    # Normalize if requested
-    if normalize:
-        arr = arr.astype(np.float32)
-        min_val = arr.min()
-        max_val = arr.max()
-        if max_val > min_val:
-            arr = (arr - min_val) / (max_val - min_val)
-
-    return arr, ds
+    return arr

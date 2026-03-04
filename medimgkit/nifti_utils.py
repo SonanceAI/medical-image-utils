@@ -5,8 +5,8 @@ import logging
 from pathlib import Path
 import nibabel as nib
 import gzip
-from medimgkit import GZIP_MIME_TYPES
-from typing import BinaryIO, Literal
+from medimgkit import GZIP_MIME_TYPES, ViewPlane
+from typing import BinaryIO
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +42,17 @@ def _read_slice_or_full(nibdata: SpatialImage,
         raise ValueError("slice_index must be provided if slice_axis is provided")
 
     return nibdata.get_fdata()
+
+
+def rawplaneaxis2stdplaneaxis_idx(axis_idx: int) -> int:
+    if axis_idx == 0:
+        return 3
+    elif axis_idx == 1:
+        return 2
+    elif axis_idx == 2:
+        return 0
+    else:
+        raise ValueError(f"Invalid raw plane axis index: {axis_idx}. Must be 0, 1, or 2.")
 
 
 def read_nifti(file_path: str | BinaryIO,
@@ -93,7 +104,7 @@ def read_nifti(file_path: str | BinaryIO,
         imgs = imgs.transpose(2, 1, 0)
         imgs = imgs[:, np.newaxis]
     elif imgs.ndim == 4:
-        # (H, W, #frames, C)
+        # (H, W, depth, C) -> (depth, C, H, W)
         imgs = imgs.transpose(2, 3, 1, 0)
     else:
         raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim} with {imgs.shape=}")
@@ -309,7 +320,7 @@ def check_nifti_magic_numbers(data: bytes) -> bool:
 
 
 def get_plane_axis(data: SpatialImage,
-                   plane: Literal['axial', 'sagittal', 'coronal']) -> int:
+                   plane: ViewPlane) -> int:
     """
     Maps an anatomical plane ('axial', 'sagittal', 'coronal') to its 
     corresponding axis index (0, 1, or 2) in the get_fdata() numpy array.
@@ -345,27 +356,25 @@ def get_plane_axis(data: SpatialImage,
 axis_name_to_axis_index = get_plane_axis  # alias for backward compatibility
 
 
-def get_dim_size(data: SpatialImage | str | Path, axis_index: int) -> int:
+def get_dim_size(data: SpatialImage,
+                 axis_index: int | ViewPlane) -> int:
     """
     Get the size of a specific dimension (axis) from a NIfTI image.
 
     Reads only the header — voxel data is never loaded into memory.
 
     Args:
-        data (SpatialImage | str | Path): The NIfTI image or path to one.
-        axis_index (int): Index of the axis.
+        data (SpatialImage): The NIfTI image.
+        axis_index (int | str): Index of the axis, or an anatomical plane name
+            ('axial', 'sagittal', 'coronal') which is resolved via ``get_plane_axis``.
 
     Returns:
         int: Size of the specified dimension.
     """
-    if axis_index > 4:
-        raise ValueError(f"Invalid axis_index {axis_index}. Must be between 0 and 4.")
-    if isinstance(data, (str, Path)):
-        # nib.load() is lazy — only the header is read, no voxel data loaded
-        shape = nib.load(data).header.get_data_shape()
-    else:
-        shape = data.shape
-    return int(shape[axis_index])
+    if isinstance(axis_index, str):
+        axis_index = get_plane_axis(data, axis_index)
+
+    return int(data.shape[axis_index])
 
 
 def get_nifti_shape(file_path: str) -> tuple[int, ...]:

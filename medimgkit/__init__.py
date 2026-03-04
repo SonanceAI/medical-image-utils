@@ -1,5 +1,6 @@
 """Medical Image Utils - Utilities for working with medical images."""
 import importlib.metadata
+from typing import Literal, TypeAlias
 
 __version__ = importlib.metadata.version(__name__)
 
@@ -12,6 +13,8 @@ _MAP_STANDARD_MIME_TYPES_ = {
 }
 
 GZIP_MIME_TYPES = ('application/gzip', 'application/x-gzip')
+
+ViewPlane: TypeAlias = Literal['axial', 'sagittal', 'coronal']
 
 def standardize_mimetype(mimetype: str) -> str:
     """

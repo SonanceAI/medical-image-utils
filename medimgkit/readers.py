@@ -31,7 +31,7 @@ from PIL import Image
 import logging
 import tempfile
 import shutil
-from .nifti_utils import read_nifti, NIFTI_MIMES
+from .nifti_utils import read_nifti
 from .dicom_utils import read_dicom_standardized as read_dicom
 from .format_detection import guess_type, GZIP_MIME_TYPES
 from typing import Any, BinaryIO, overload, Literal
