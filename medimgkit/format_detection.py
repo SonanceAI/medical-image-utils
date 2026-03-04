@@ -7,7 +7,7 @@ from typing import IO
 from .io_utils import is_io_object, peek
 import gzip
 import io
-from medimgkit import GZIP_MIME_TYPES
+from medimgkit import GZIP_MIME_TYPES, standardize_mimetype
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_MIME_TYPE = 'application/octet-stream'
@@ -54,6 +54,12 @@ def magic_from_buffer(buffer: bytes, mime=True) -> str:
 
 
 def guess_type(name: str | Path | IO | bytes,
+               use_magic=True,
+               force_magic=False):
+    mimetype, suffix = _guess_type(name, use_magic=use_magic, force_magic=force_magic)
+    return standardize_mimetype(mimetype) if mimetype else None, suffix
+
+def _guess_type(name: str | Path | IO | bytes,
                use_magic=True,
                force_magic=False):
     """
