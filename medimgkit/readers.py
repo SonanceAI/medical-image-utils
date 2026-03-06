@@ -133,6 +133,9 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
         file_path: The path to the file or a file-like object.
         index: If specified, read only the frame at this index (0-based).
             If None, read all frames.
+        return_metainfo: If True, also return metadata information (e.g. DICOM tags, NIfTI header).
+        use_magic: Whether to use file content (magic numbers) for MIME type detection.
+        mime_type: Optionally specify the MIME type of the file to bypass detection.
         Supported file formats are NIfTI (.nii, .nii.gz), PNG (.png), JPEG (.jpg, .jpeg) and npy (.npy).
 
     Returns:

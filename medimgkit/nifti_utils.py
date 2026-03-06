@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import nibabel as nib
 import gzip
+from contextlib import contextmanager
 from medimgkit import GZIP_MIME_TYPES, ViewPlane
 from typing import BinaryIO
 
@@ -55,7 +56,21 @@ def rawplaneaxis2stdplaneaxis_idx(axis_idx: int) -> int:
         raise ValueError(f"Invalid raw plane axis index: {axis_idx}. Must be 0, 1, or 2.")
 
 
-def read_nifti(file_path: str | BinaryIO,
+@contextmanager
+def _open_stream(f_io: BinaryIO,
+                 mimetype: str | None = None):
+    try:
+        if mimetype is None or mimetype in GZIP_MIME_TYPES:
+            with gzip.open(f_io, 'rb') as f:
+                yield nib.Nifti1Image.from_stream(f)
+                return
+    except gzip.BadGzipFile:
+        pass  # Not a gzip file, try other methods
+
+    yield nib.Nifti1Image.from_stream(f_io)
+
+
+def read_nifti(file_path: str | Path | BinaryIO,
                mimetype: str | None = None,
                slice_index: int | None = None,
                slice_axis: int | None = None) -> tuple[np.ndarray, SpatialImage]:
@@ -72,28 +87,19 @@ def read_nifti(file_path: str | BinaryIO,
     if slice_axis is not None and slice_index is None:
         raise ValueError("slice_index must be provided if slice_axis is provided")
 
-    try:
-        if isinstance(file_path, (str, Path)):
+    if isinstance(file_path, (str, Path)):
+        try:
             nibdata = nib.load(file_path)
             imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
-        else:
-            with gzip.open(file_path, 'rb') as f:
-                nibdata = nib.Nifti1Image.from_stream(f)
-                imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
-    except ImageFileError:
-        if mimetype is None:
-            raise
-        # has_ext = os.path.splitext(file_path)[1] != ''
-        if mimetype in GZIP_MIME_TYPES:
-            with gzip.open(file_path, 'rb') as f:
-                nibdata = nib.Nifti1Image.from_stream(f)
-                imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
-        elif mimetype in NIFTI_MIMES:
+        except ImageFileError:
+            # it is possible that the file is a NIfTI file but with an unrecognized extension.
             with open(file_path, 'rb') as f:
-                nibdata = nib.Nifti1Image.from_stream(f)
-                imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
-        else:
-            raise
+                with _open_stream(f, mimetype) as nibdata:
+                    imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+    else:
+        with _open_stream(file_path, mimetype) as nibdata:
+            imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+
     if imgs.ndim == 2:
         imgs = imgs.transpose(1, 0)
         if slice_index is None:

@@ -1,4 +1,3 @@
-import pandas as pd
 from pydicom import dcmread
 from pydicom.pixels.utils import pixel_array
 import pydicom
@@ -606,7 +605,6 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     if infer_laterality:
         ### infer laterality and update tag if necessary ###
         localizers, non_localizers = _find_localizers(dicom_list)
-        _LOGGER.debug(f'{len(localizers)=}, {len(non_localizers)=}`')
         dicoms_map = _group_dicoms_by_tags(dicom_list, ['FrameOfReferenceUID'])
         for composite_key, grouped_dicoms in dicoms_map.items():
             # if FrameOfReferenceUID is not valid, skip
@@ -1344,8 +1342,6 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
                         f"differs from inferred spacing from positions ({step_projs[0]:.4f} mm). "
                         f"Using inferred spacing.")
             slice_spacing = float(step_projs[0])
-            _LOGGER.debug(
-                f"Using inferred slice spacing from positions after consistency check: {slice_spacing:.4f} mm")
 
     # Build affine: consistent with pixel_to_patient() in this module.
     # Voxel coords are interpreted as (pixel_x, pixel_y, slice_index).
@@ -1353,7 +1349,6 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
     col0 = row_dir * col_spacing
     col1 = col_dir * row_spacing
     col2 = slice_dir * float(slice_spacing)
-    _LOGGER.debug(f"Affine columns:\n Col0 (X): {col0}\n Col1 (Y): {col1}\n Col2 (Z): {col2}\n Origin: {origin}")
 
     affine = np.eye(4, dtype=np.float64)
     affine[:3, 0] = col0
@@ -1565,7 +1560,7 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
         name = 'Axial'
         val = axis_vector[2]
     else:
-        _LOGGER.debug(f"Unrecognized anatomical plane for {axis_vector} with largest component {largest_component}")
+        _LOGGER.info(f"Unrecognized anatomical plane for {axis_vector} with largest component {largest_component}")
         return "Unknown", 0
 
     degrees = np.degrees(np.arccos(val/np.linalg.norm(axis_vector)))
@@ -1573,7 +1568,6 @@ def determine_anatomical_plane(axis_vector: np.ndarray,
     if degrees <= alignment_threshold:
         return name, degrees
     else:
-        # _LOGGER.debug(f"Anatomical plane for {axis_vector} is oblique with {degrees:.2f} degrees off {name}")
         return "Oblique", degrees
 
 
@@ -1673,8 +1667,11 @@ def get_dim_size(ds: pydicom.Dataset,
         int: Size of the specified dimension (axis).
     """
     if isinstance(axis_index, str):
-        if axis_index := get_plane_axis(ds, axis_index) is None:
-            raise ValueError(f"Could not determine axis index for plane '{axis_index}' in DICOM dataset.")
+        new_axis_index = get_plane_axis(ds, axis_index)
+        if new_axis_index is None:
+            raise ValueError(f"Could not determine axis index for plane '{axis_index}' in DICOM dataset."
+                             " The data may be too oblique or missing orientation information.")
+        axis_index = new_axis_index
 
     if axis_index == 0:
         return get_number_of_slices(ds)
@@ -1849,7 +1846,6 @@ def parse_dicomdir_files(dicomdir_path: Path) -> list[Path]:
 
                     if absolute_path.exists():
                         referenced_files.append(absolute_path)
-                        _LOGGER.debug(f"Found referenced DICOM file: {absolute_path}")
                     else:
                         _LOGGER.warning(f"Referenced file not found: {absolute_path}")
 
@@ -1882,7 +1878,7 @@ def create_3d_dicom_viewer(dicom_list: Sequence[pydicom.Dataset] | Sequence[str]
                     - 'constant': Use fixed plane_size for all planes
         opacity: Opacity of the plane meshes (0.0 = fully transparent, 1.0 = fully opaque)
     """
-
+    import pandas as pd
     # ImagePositionPatient: The x, y, and z coordinates of the upper left hand corner (center of the first voxel transmitted) of the image, in mm.
 
     # validate parameters
