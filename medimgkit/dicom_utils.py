@@ -1512,13 +1512,13 @@ def determine_anatomical_plane_from_dicom(ds: pydicom.Dataset,
         normal = normal / np.linalg.norm(normal)  # Normalize
         examine_vector = normal
     elif slice_axis == 1:
-        # ds.pixel_array[:,0,:] - slicing along second dimension
-        # This corresponds to the row direction
-        examine_vector = row_dir
-    else:  # slice_axis == 2
-        # ds.pixel_array[:,:,0] - slicing along third dimension
-        # This corresponds to the column direction
+        # ds.pixel_array[:,0,:] - fixing row index
+        # Row index increases along col_dir, so fixing it fixes position along col_dir
         examine_vector = col_dir
+    else:  # slice_axis == 2
+        # ds.pixel_array[:,:,0] - fixing col index
+        # Col index increases along row_dir, so fixing it fixes position along row_dir
+        examine_vector = row_dir
     # Find which anatomical axis is most aligned with our examine_vector
 
     plane = determine_anatomical_plane(examine_vector, alignment_threshold)[0]
@@ -1620,10 +1620,14 @@ def get_plane_axis(ds: pydicom.Dataset,
     normal = np.cross(row_dir, col_dir)
 
     # axis index → direction vector
+    # row_dir = direction of increasing column index
+    # col_dir = direction of increasing row index
+    # Fixing row index (axis 1) fixes position along col_dir.
+    # Fixing col index (axis 2) fixes position along row_dir.
     axis_vectors: list[tuple[int, np.ndarray]] = [
         (0, normal),   # slice / frame direction
-        (1, row_dir),  # row direction
-        (2, col_dir),  # column direction
+        (1, col_dir),  # row axis: row index moves along col_dir
+        (2, row_dir),  # col axis: col index moves along row_dir
     ]
 
     for axis_idx, vec in axis_vectors:
