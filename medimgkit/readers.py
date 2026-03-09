@@ -205,7 +205,6 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
         else:
             if mime_type.startswith('video/'):
                 imgs = read_video(file_path, index)
-
             elif mime_type.startswith('image/'):
                 imgs = read_image(file_path)
             elif mime_type == 'application/x-numpy-data':
@@ -221,7 +220,7 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
             else:
                 raise ValueError(f"Unsupported file format '{mime_type}' of '{file_path}'")
 
-            if index is not None:
+            if index is not None and imgs.ndim == 4:
                 if len(imgs) > 1:
                     _LOGGER.warning(f"It is inefficient to load all frames from '{file_path}' to access a single frame." +
                                     " Consider converting the file to a format that supports random access (DICOM), or" +
