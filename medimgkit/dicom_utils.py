@@ -22,6 +22,7 @@ import hashlib
 from .io_utils import peek, is_io_object
 from deprecated import deprecated
 from medimgkit import ViewPlane
+from pydicom.uid import JPEGLSLossless
 
 DICOM_EXTENSIONS = ['.dcm', '.dicom']
 
@@ -854,6 +855,16 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
             if hasattr(merged_dicom, attr):
                 if not all(ds.get(attr) == merged_dicom.get(attr) for ds in dicoms):
                     delattr(merged_dicom, attr)
+
+        # Try to compress the assembled DICOM with JPEG-LS Lossless.
+        # Falls back to uncompressed (ImplicitVRLittleEndian) if compression fails.
+        try:
+            merged_dicom.compress(JPEGLSLossless)
+        except Exception as e:
+            _LOGGER.warning(
+                f"Could not compress assembled DICOM with JPEG-LS Lossless: {e}. "
+                "Falling back to uncompressed."
+            )
 
         if return_as_IO:
             # generate base name
