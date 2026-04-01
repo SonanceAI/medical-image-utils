@@ -179,7 +179,7 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
             if not is_path:
                 file_path.seek(0)
             imgs, nibmetainfo = read_nifti(file_path,
-                                           mimetype=mime_type,
+                                           mimetype=None,  # let read_nifti handle the MIME type detection for NIfTI files bc of gzipped NIfTI files
                                            slice_index=index,
                                            slice_axis=None)
             # For NIfTI files, try to load associated JSON metadata
