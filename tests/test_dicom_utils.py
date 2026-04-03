@@ -240,9 +240,12 @@ class TestDicomUtils:
         ds.SpacingBetweenSlices = 4.0
 
         aff = build_affine_matrix(ds)
+        # Voxel coords are (pixel_x, pixel_y, slice_index) where:
+        #   pixel_x = column index -> moves along row_dir by col_spacing (3.0)
+        #   pixel_y = row index    -> moves along col_dir by row_spacing (2.0)
         expected = np.array([
-            [2.0, 0.0, 0.0, 10.0],
-            [0.0, 3.0, 0.0, 20.0],
+            [3.0, 0.0, 0.0, 10.0],
+            [0.0, 2.0, 0.0, 20.0],
             [0.0, 0.0, 4.0, 30.0],
             [0.0, 0.0, 0.0, 1.0],
         ], dtype=np.float64)
