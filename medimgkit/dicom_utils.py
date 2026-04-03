@@ -11,6 +11,7 @@ from typing import IO, TypeVar, Generic, Literal
 from collections.abc import Sequence, Generator
 import warnings
 from copy import deepcopy
+from datetime import datetime
 import logging
 import json
 from pathlib import Path
@@ -20,6 +21,7 @@ import numpy as np
 from collections import defaultdict, OrderedDict
 import uuid
 import hashlib
+from pydicom.tag import BaseTag, Tag
 from .io_utils import peek, is_io_object
 from deprecated import deprecated
 from medimgkit import ViewPlane
@@ -98,6 +100,136 @@ _MODALITY_THRESHOLDS = {
     'XA': 25.0,
     'US': 42.0
 }
+
+_LEGACY_CONVERTED_SOP_CLASS_UID_MAP = {
+    str(pydicom.uid.CTImageStorage): pydicom.uid.LegacyConvertedEnhancedCTImageStorage,
+    str(pydicom.uid.MRImageStorage): pydicom.uid.LegacyConvertedEnhancedMRImageStorage,
+    str(pydicom.uid.PositronEmissionTomographyImageStorage): pydicom.uid.LegacyConvertedEnhancedPETImageStorage,
+}
+
+_MODALITY_TO_LEGACY_CONVERTED_SOP_CLASS_UID_MAP = {
+    'CT': pydicom.uid.LegacyConvertedEnhancedCTImageStorage,
+    'MR': pydicom.uid.LegacyConvertedEnhancedMRImageStorage,
+    'PT': pydicom.uid.LegacyConvertedEnhancedPETImageStorage,
+}
+
+_CONCATENATION_TAGS = (
+    Tag(0x0020, 0x0242),
+    Tag(0x0020, 0x9161),
+    Tag(0x0020, 0x9162),
+    Tag(0x0020, 0x9163),
+    Tag(0x0020, 0x9228),
+)
+
+_UNASSIGNED_CONVERTED_ATTRS_EXCLUDED_TAGS = {
+    Tag(0x0008, 0x0016),
+    Tag(0x0008, 0x0018),
+    Tag(0x0018, 0xA001),
+    Tag(0x0020, 0x0032),
+    Tag(0x0020, 0x0037),
+    Tag(0x0020, 0x9170),
+    Tag(0x0020, 0x9171),
+    Tag(0x0020, 0x9172),
+    Tag(0x0028, 0x0008),
+    Tag(0x0028, 0x0030),
+    Tag(0x5200, 0x9229),
+    Tag(0x5200, 0x9230),
+    Tag(0x7FE0, 0x0010),
+    Tag(0x0018, 0x0088),
+    Tag(0x0020, 0x1041),
+    *set(_CONCATENATION_TAGS),
+}
+
+_PRESERVED_TOPLEVEL_CONVERTED_TAGS = {
+    Tag(0x0008, 0x0021),
+    Tag(0x0008, 0x0031),
+}
+
+
+def _make_code_item(code_value: str,
+                    code_meaning: str,
+                    coding_scheme_designator: str = 'DCM') -> pydicom.Dataset:
+    item = pydicom.Dataset()
+    item.CodeValue = str(code_value)
+    item.CodingSchemeDesignator = coding_scheme_designator
+    item.CodeMeaning = code_meaning
+    return item
+
+
+def _now_dicom_datetime() -> str:
+    return datetime.now().astimezone().strftime('%Y%m%d%H%M%S.%f%z')
+
+
+def _get_legacy_converted_sop_class_uid(ds: pydicom.Dataset) -> pydicom.uid.UID | str | None:
+    sop_class_uid = ds.get('SOPClassUID')
+    if sop_class_uid is not None:
+        sop_class_uid_str = str(sop_class_uid)
+        if _is_multiframe_SOPClass(pydicom.uid.UID(sop_class_uid_str)):
+            return sop_class_uid
+        if sop_class_uid_str in _LEGACY_CONVERTED_SOP_CLASS_UID_MAP:
+            return _LEGACY_CONVERTED_SOP_CLASS_UID_MAP[sop_class_uid_str]
+
+    modality = str(ds.get('Modality') or '').upper()
+    return _MODALITY_TO_LEGACY_CONVERTED_SOP_CLASS_UID_MAP.get(modality, sop_class_uid)
+
+
+def _remove_concatenation_attributes(ds: pydicom.Dataset) -> None:
+    for tag in _CONCATENATION_TAGS:
+        if tag in ds:
+            del ds[tag]
+
+
+def _set_series_date_and_time_from_sources(merged_ds: pydicom.Dataset,
+                                           all_dicoms: Sequence[pydicom.Dataset]) -> None:
+    series_dates = [str(ds.get('SeriesDate')) for ds in all_dicoms if ds.get('SeriesDate')]
+    if series_dates:
+        merged_ds.SeriesDate = min(series_dates)
+
+    series_times = [str(ds.get('SeriesTime')) for ds in all_dicoms if ds.get('SeriesTime')]
+    if series_times:
+        merged_ds.SeriesTime = min(series_times)
+
+
+def _set_instance_creation_timestamps(merged_ds: pydicom.Dataset) -> None:
+    now = datetime.now().astimezone()
+    merged_ds.InstanceCreationDate = now.strftime('%Y%m%d')
+    merged_ds.InstanceCreationTime = now.strftime('%H%M%S.%f')
+    merged_ds.InstanceCoercionDateTime = now.strftime('%Y%m%d%H%M%S.%f%z')
+
+
+def _normalized_contributing_equipment_sequence(seq: Sequence[pydicom.Dataset]) -> list[pydicom.Dataset]:
+    normalized_items: list[pydicom.Dataset] = []
+    for item in seq:
+        normalized_item = deepcopy(item)
+        if 'ContributionDateTime' in normalized_item:
+            del normalized_item.ContributionDateTime
+        normalized_items.append(normalized_item)
+    return normalized_items
+
+
+def _build_contributing_equipment_item() -> pydicom.Dataset:
+    equipment_item = pydicom.Dataset()
+    equipment_item.PurposeOfReferenceCodeSequence = pydicom.Sequence([
+        _make_code_item('109106', 'Enhanced Multi-frame Conversion Equipment')
+    ])
+    equipment_item.Manufacturer = 'medimgkit'
+    equipment_item.ManufacturerModelName = 'assemble_dicoms'
+    equipment_item.SoftwareVersions = 'medimgkit'
+    equipment_item.ContributionDateTime = _now_dicom_datetime()
+    equipment_item.ContributionDescription = 'Legacy Enhanced Image created from Classic Images'
+    return equipment_item
+
+
+def _add_contributing_equipment_sequence(merged_ds: pydicom.Dataset,
+                                         source_sequences: Sequence[pydicom.Sequence | None]) -> None:
+    preserved_source_sequences = [deepcopy(seq) for seq in source_sequences if seq is not None]
+    merged_sequence = pydicom.Sequence()
+    if len(preserved_source_sequences) == len(source_sequences) and len(source_sequences) > 0:
+        normalized_sequences = [_normalized_contributing_equipment_sequence(seq) for seq in preserved_source_sequences]
+        if all(seq == normalized_sequences[0] for seq in normalized_sequences[1:]):
+            merged_sequence.extend(preserved_source_sequences[0])
+    merged_sequence.append(_build_contributing_equipment_item())
+    merged_ds.ContributingEquipmentSequence = merged_sequence
 
 
 def get_oblique_threshold(ds: pydicom.Dataset | str,
@@ -792,6 +924,86 @@ def _collect_source_metadata(all_dicoms: Sequence[pydicom.Dataset]) -> list[dict
     ]
 
 
+def _build_image_reference_item(source: dict[str, str]) -> pydicom.Dataset:
+    reference_item = pydicom.Dataset()
+    if source['sop_class_uid']:
+        reference_item.ReferencedSOPClassUID = source['sop_class_uid']
+    if source['sop_instance_uid']:
+        reference_item.ReferencedSOPInstanceUID = source['sop_instance_uid']
+    return reference_item
+
+
+def _get_unassigned_converted_elements(ds: pydicom.Dataset) -> dict[BaseTag, pydicom.DataElement]:
+    elements: dict[BaseTag, pydicom.DataElement] = {}
+    for element in ds:
+        if element.tag.group == 0x0002 or element.tag.element == 0x0000:
+            continue
+        if element.tag in _UNASSIGNED_CONVERTED_ATTRS_EXCLUDED_TAGS:
+            continue
+        elements[element.tag] = deepcopy(element)
+    return elements
+
+
+def _add_unassigned_converted_attributes(merged_ds: pydicom.Dataset,
+                                         candidate_elements: Sequence[dict[BaseTag, pydicom.DataElement]]) -> None:
+    shared_seq = merged_ds.get('SharedFunctionalGroupsSequence')
+    if shared_seq is None or len(shared_seq) == 0:
+        merged_ds.SharedFunctionalGroupsSequence = pydicom.Sequence([pydicom.Dataset()])
+        shared_seq = merged_ds.SharedFunctionalGroupsSequence
+    shared_seq_dataset = shared_seq[0]
+
+    perframe_seq = merged_ds.get('PerFrameFunctionalGroupsSequence')
+    if perframe_seq is None or len(perframe_seq) != len(candidate_elements):
+        merged_ds.PerFrameFunctionalGroupsSequence = pydicom.Sequence([pydicom.Dataset() for _ in candidate_elements])
+        perframe_seq = merged_ds.PerFrameFunctionalGroupsSequence
+
+    all_tags = sorted({tag for elements in candidate_elements for tag in elements})
+
+    shared_unassigned = pydicom.Dataset()
+    perframe_unassigned = [pydicom.Dataset() for _ in candidate_elements]
+
+    for tag in all_tags:
+        elements_for_tag = [elements.get(tag) for elements in candidate_elements]
+        first_element = next((element for element in elements_for_tag if element is not None), None)
+        if first_element is None:
+            continue
+
+        if all(element is not None and element == first_element for element in elements_for_tag):
+            if tag in merged_ds and merged_ds[tag] == first_element:
+                continue
+            shared_unassigned.add(deepcopy(first_element))
+            continue
+
+        if tag in merged_ds and tag not in _PRESERVED_TOPLEVEL_CONVERTED_TAGS:
+            del merged_ds[tag]
+
+        for index, element in enumerate(elements_for_tag):
+            if element is not None:
+                perframe_unassigned[index].add(deepcopy(element))
+
+    if len(shared_unassigned) > 0:
+        shared_seq_dataset.UnassignedSharedConvertedAttributesSequence = pydicom.Sequence([shared_unassigned])
+
+    for perframe_ds, unassigned_ds in zip(perframe_seq, perframe_unassigned):
+        if len(unassigned_ds) > 0:
+            perframe_ds.UnassignedPerFrameConvertedAttributesSequence = pydicom.Sequence([unassigned_ds])
+
+
+def _add_legacy_conversion_metadata(merged_ds: pydicom.Dataset,
+                                    source_metadata: Sequence[dict[str, str]],
+                                    candidate_elements: Sequence[dict[BaseTag, pydicom.DataElement]],
+                                    source_contributing_equipment_sequences: Sequence[pydicom.Sequence | None]) -> None:
+    perframe_seq = merged_ds.get('PerFrameFunctionalGroupsSequence')
+    if perframe_seq is not None and len(perframe_seq) == len(source_metadata):
+        for perframe_ds, source in zip(perframe_seq, source_metadata):
+            ref_item = _build_image_reference_item(source)
+            if len(ref_item) > 0:
+                perframe_ds.ConversionSourceAttributesSequence = pydicom.Sequence([ref_item])
+
+    _add_unassigned_converted_attributes(merged_ds, candidate_elements)
+    _add_contributing_equipment_sequence(merged_ds, source_contributing_equipment_sequences)
+
+
 def _add_source_metadata(merged_ds: pydicom.Dataset,
                          source_metadata: Sequence[dict[str, str]]) -> None:
     """
@@ -811,12 +1023,8 @@ def _add_source_metadata(merged_ds: pydicom.Dataset,
     # 1. Top-level SourceImageSequence (0008,2112)
     source_image_seq = []
     for source in source_metadata:
-        sop_class = source['sop_class_uid']
-        sop_instance = source['sop_instance_uid']
-        if sop_class and sop_instance:
-            ref_item = pydicom.Dataset()
-            ref_item.ReferencedSOPClassUID = sop_class
-            ref_item.ReferencedSOPInstanceUID = sop_instance
+        ref_item = _build_image_reference_item(source)
+        if len(ref_item) > 0:
             source_image_seq.append(ref_item)
     if source_image_seq:
         merged_ds.SourceImageSequence = pydicom.Sequence(source_image_seq)
@@ -825,12 +1033,8 @@ def _add_source_metadata(merged_ds: pydicom.Dataset,
     perframe_seq = merged_ds.get('PerFrameFunctionalGroupsSequence')
     if perframe_seq is not None and len(perframe_seq) == len(source_metadata):
         for per_frame_ds, source in zip(perframe_seq, source_metadata):
-            sop_class = source['sop_class_uid']
-            sop_instance = source['sop_instance_uid']
-            if sop_class and sop_instance:
-                src_ref = pydicom.Dataset()
-                src_ref.ReferencedSOPClassUID = sop_class
-                src_ref.ReferencedSOPInstanceUID = sop_instance
+            src_ref = _build_image_reference_item(source)
+            if len(src_ref) > 0:
                 deriv_item = pydicom.Dataset()
                 deriv_item.SourceImageSequence = pydicom.Sequence([src_ref])
                 per_frame_ds.DerivationImageSequence = pydicom.Sequence([deriv_item])
@@ -861,6 +1065,11 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
     for _, dicoms in dicoms_map.items():
         dicoms.sort(key=lambda ds: 0 if ds.get('InstanceNumber') is None else ds.get('InstanceNumber'))
         source_metadata = _collect_source_metadata(dicoms)
+        source_unassigned_elements = [_get_unassigned_converted_elements(ds) for ds in dicoms]
+        source_contributing_equipment_sequences = [
+            deepcopy(ds.ContributingEquipmentSequence) if ds.get('ContributingEquipmentSequence') else None
+            for ds in dicoms
+        ]
         # Use the first dicom as a template
         merged_dicom = dicoms[0]
         if len(dicoms) == 1:
@@ -891,19 +1100,20 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
 
         # Update the merged dicom
         merged_dicom.PixelData = pixel_arrays.tobytes()
-        if _is_multiframe_SOPClass(merged_dicom.SOPClassUID):
-            if len(pixel_arrays) == 1:
-                _LOGGER.warning('Single frame DICOM detected in multi-frame SOP Class.')
-        elif merged_dicom.get('SOPClassUID') == pydicom.uid.MRImageStorage:  # single-frame MR Image Storage
-            _LOGGER.info(f"Converting single-frame SOP Class UID to multi-frame.")
-            merged_dicom.SOPClassUID = pydicom.uid.EnhancedMRImageStorage  # Multi-frame MR Image Storage
-            merged_dicom.file_meta.MediaStorageSOPClassUID = merged_dicom.SOPClassUID
+        target_sop_class_uid = _get_legacy_converted_sop_class_uid(merged_dicom)
+        if target_sop_class_uid is not None and target_sop_class_uid != merged_dicom.get('SOPClassUID'):
+            _LOGGER.info(f"Converting assembled DICOM SOP Class UID to {target_sop_class_uid}.")
+            merged_dicom.SOPClassUID = pydicom.uid.UID(str(target_sop_class_uid))
         merged_dicom.NumberOfFrames = len(pixel_arrays)  # Set number of frames
         merged_dicom.SOPInstanceUID = pydicom.uid.generate_uid()  # Generate new SOP Instance UID
+        merged_dicom.SeriesInstanceUID = pydicom.uid.generate_uid()
         merged_dicom.file_meta.MediaStorageSOPInstanceUID = merged_dicom.SOPInstanceUID
-        merged_dicom.file_meta.MediaStorageSOPClassUID = merged_dicom.SOPClassUID
+        merged_dicom.file_meta.MediaStorageSOPClassUID = pydicom.uid.UID(str(merged_dicom.SOPClassUID))
         # Removed deprecated attributes and set Transfer Syntax UID instead:
         merged_dicom.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
+        _remove_concatenation_attributes(merged_dicom)
+        _set_series_date_and_time_from_sources(merged_dicom, dicoms)
+        _set_instance_creation_timestamps(merged_dicom)
 
         # Free up memory
         for ds in dicoms[1:]:
@@ -940,6 +1150,12 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
         if image_type and image_type[0] != 'DERIVED':
             image_type[0] = 'DERIVED'
             merged_dicom.ImageType = image_type
+        _add_legacy_conversion_metadata(
+            merged_dicom,
+            source_metadata,
+            source_unassigned_elements,
+            source_contributing_equipment_sequences,
+        )
         _add_source_metadata(merged_dicom, source_metadata)
 
         # Try to compress the assembled DICOM with JPEG-LS Lossless.

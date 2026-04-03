@@ -2,13 +2,69 @@ import pytest
 import pydicom
 import pydicom.uid
 import numpy as np
+import json
+from pydicom.dataset import FileDataset, FileMetaDataset
 
-from medimgkit.dicom_utils import anonymize_dicom, CLEARED_STR, is_dicom, TokenMapper, build_affine_matrix
+from medimgkit.dicom_utils import assemble_dicoms, anonymize_dicom, CLEARED_STR, is_dicom, TokenMapper, build_affine_matrix
 import pydicom.data
 from io import BytesIO
 import warnings
 
 class TestDicomUtils:
+    def _write_single_frame_dicom(self,
+                                  tmp_path,
+                                  filename: str,
+                                  pixel_value: int,
+                                  instance_number: int,
+                                  sop_instance_uid: str,
+                                  series_instance_uid: str,
+                                  acquisition_time: str,
+                                  private_creator: str | None = None) -> str:
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.CTImageStorage
+        file_meta.MediaStorageSOPInstanceUID = pydicom.uid.UID(sop_instance_uid)
+        file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
+
+        file_path = tmp_path / filename
+        ds = FileDataset(str(file_path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+        ds.SOPClassUID = pydicom.uid.CTImageStorage
+        ds.SOPInstanceUID = sop_instance_uid
+        ds.StudyInstanceUID = '1.2.826.0.1.3680043.8.498.100'
+        ds.SeriesInstanceUID = series_instance_uid
+        ds.FrameOfReferenceUID = '1.2.826.0.1.3680043.8.498.300'
+        ds.Modality = 'CT'
+        ds.SeriesDate = '20260102'
+        ds.SeriesTime = acquisition_time
+        ds.AcquisitionTime = acquisition_time
+        ds.SeriesDescription = 'Converted Test Series'
+        ds.PatientName = 'Test^Patient'
+        ds.PatientID = '12345'
+        ds.ImageType = ['ORIGINAL', 'PRIMARY', 'AXIAL']
+        ds.Rows = 2
+        ds.Columns = 2
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 0
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+        ds.PixelSpacing = [1.0, 1.0]
+        ds.SliceThickness = 5.0
+        ds.SpacingBetweenSlices = 5.0
+        ds.ImageOrientationPatient = [1.0, 0.0, 0.0,
+                                      0.0, 1.0, 0.0]
+        ds.ImagePositionPatient = [0.0, 0.0, float((instance_number - 1) * 5.0)]
+        ds.InstanceNumber = instance_number
+        ds.PixelData = np.full((2, 2), pixel_value, dtype=np.uint16).tobytes()
+
+        if private_creator is not None:
+            private_block = ds.private_block(0x0009, private_creator, create=True)
+            private_block.add_new(0x01, 'LO', 'sentinel')
+
+        ds.save_as(str(file_path), enforce_file_format=True)
+        return str(file_path)
+
     @pytest.fixture
     def sample_dataset1(self):
         ds = pydicom.Dataset()
@@ -87,7 +143,7 @@ class TestDicomUtils:
         ds.add_new((0x0008, 0x1140), 'SQ', [seq_dataset])  # ReferencedImageSequence
         
         # File meta
-        ds.file_meta = pydicom.Dataset()
+        ds.file_meta = FileMetaDataset()
         ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
         
         return ds
@@ -150,8 +206,8 @@ class TestDicomUtils:
         ds.PatientName = "Test Patient"
         # No SOPInstanceUID
         
-        ds.file_meta = pydicom.Dataset()
-        ds.file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.5"
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.MediaStorageSOPInstanceUID = pydicom.uid.UID("1.2.3.4.5")
         
         # Should not raise exception
         anonymized_ds = anonymize_dicom(ds, copy=True)
@@ -316,3 +372,108 @@ class TestDicomUtils:
 
         with pytest.raises(ValueError):
             build_affine_matrix(ds)
+
+    def test_assemble_dicoms_adds_legacy_conversion_metadata(self, tmp_path):
+        original_series_uid = '1.2.826.0.1.3680043.8.498.200'
+        sop_uid_1 = '1.2.826.0.1.3680043.8.498.1001'
+        sop_uid_2 = '1.2.826.0.1.3680043.8.498.1002'
+
+        path1 = self._write_single_frame_dicom(
+            tmp_path,
+            'slice1.dcm',
+            1,
+            1,
+            sop_uid_1,
+            original_series_uid,
+            '090100.000000',
+        )
+        path2 = self._write_single_frame_dicom(
+            tmp_path,
+            'slice2.dcm',
+            2,
+            2,
+            sop_uid_2,
+            original_series_uid,
+            '090200.000000',
+        )
+
+        merged = next(iter(assemble_dicoms([path1, path2], progress_bar=False)))
+
+        assert merged.SOPClassUID == pydicom.uid.LegacyConvertedEnhancedCTImageStorage
+        assert merged.file_meta.MediaStorageSOPClassUID == merged.SOPClassUID
+        assert merged.file_meta.MediaStorageSOPInstanceUID == merged.SOPInstanceUID
+        assert merged.SeriesInstanceUID != original_series_uid
+        assert merged.SeriesTime == '090100.000000'
+        assert merged.StudyInstanceUID == '1.2.826.0.1.3680043.8.498.100'
+
+        referenced_uids = [item.ReferencedSOPInstanceUID for item in merged.SourceImageSequence]
+        assert referenced_uids == [sop_uid_1, sop_uid_2]
+
+        conversion_source_uids = [
+            frame.ConversionSourceAttributesSequence[0].ReferencedSOPInstanceUID
+            for frame in merged.PerFrameFunctionalGroupsSequence
+        ]
+        assert conversion_source_uids == [sop_uid_1, sop_uid_2]
+
+        contributing_item = merged.ContributingEquipmentSequence[-1]
+        purpose_item = contributing_item.PurposeOfReferenceCodeSequence[0]
+        assert purpose_item.CodeValue == '109106'
+        assert purpose_item.CodingSchemeDesignator == 'DCM'
+        assert purpose_item.CodeMeaning == 'Enhanced Multi-frame Conversion Equipment'
+        assert contributing_item.ContributionDescription == 'Legacy Enhanced Image created from Classic Images'
+
+        shared_unassigned = merged.SharedFunctionalGroupsSequence[0].UnassignedSharedConvertedAttributesSequence[0]
+        assert shared_unassigned.SeriesInstanceUID == original_series_uid
+        assert list(shared_unassigned.ImageType) == ['ORIGINAL', 'PRIMARY', 'AXIAL']
+
+        per_frame_acquisition_times = [
+            frame.UnassignedPerFrameConvertedAttributesSequence[0].AcquisitionTime
+            for frame in merged.PerFrameFunctionalGroupsSequence
+        ]
+        assert per_frame_acquisition_times == ['090100.000000', '090200.000000']
+
+        medimgkit_block = merged.private_block(0x0009, 'MEDIMGKIT')
+        mapping = json.loads(merged[medimgkit_block.get_tag(0x01)].value)
+        assert mapping == [
+            {
+                'frame': 0,
+                'sop_instance_uid': sop_uid_1,
+                'filepath': path1,
+            },
+            {
+                'frame': 1,
+                'sop_instance_uid': sop_uid_2,
+                'filepath': path2,
+            },
+        ]
+
+    def test_assemble_dicoms_keeps_existing_private_creator_block(self, tmp_path):
+        original_series_uid = '1.2.826.0.1.3680043.8.498.201'
+        path1 = self._write_single_frame_dicom(
+            tmp_path,
+            'slice1_with_private.dcm',
+            1,
+            1,
+            '1.2.826.0.1.3680043.8.498.2001',
+            original_series_uid,
+            '090100.000000',
+            private_creator='EXISTING_CREATOR',
+        )
+        path2 = self._write_single_frame_dicom(
+            tmp_path,
+            'slice2_with_private.dcm',
+            2,
+            2,
+            '1.2.826.0.1.3680043.8.498.2002',
+            original_series_uid,
+            '090200.000000',
+        )
+
+        merged = next(iter(assemble_dicoms([path1, path2], progress_bar=False)))
+
+        medimgkit_block = merged.private_block(0x0009, 'MEDIMGKIT')
+        perframe_private_ds = merged.PerFrameFunctionalGroupsSequence[0].UnassignedPerFrameConvertedAttributesSequence[0]
+        existing_block = perframe_private_ds.private_block(0x0009, 'EXISTING_CREATOR')
+
+        assert medimgkit_block.get_tag(0x01) in merged
+        assert perframe_private_ds[existing_block.get_tag(0x01)].value in {'sentinel', b'sentinel'}
