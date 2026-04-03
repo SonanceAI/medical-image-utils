@@ -12,6 +12,7 @@ from collections.abc import Sequence, Generator
 import warnings
 from copy import deepcopy
 import logging
+import json
 from pathlib import Path
 from io import BytesIO
 import os
@@ -779,6 +780,71 @@ def _is_multiframe_SOPClass(sop_class_uid: pydicom.uid.UID) -> bool:
     return False
 
 
+def _add_source_metadata(merged_ds: pydicom.Dataset,
+                         all_dicoms: Sequence[pydicom.Dataset]) -> None:
+    """
+    Attach source-image provenance to a merged/assembled DICOM dataset:
+
+    - ``SourceImageSequence`` (0008,2112): top-level sequence referencing the
+      SOPClassUID + SOPInstanceUID of every source DICOM.
+    - Per-frame ``DerivationImageSequence`` (0008,9124): added to each item of
+      ``PerFrameFunctionalGroupsSequence`` (when present), each referencing
+      the corresponding source frame by SOPInstanceUID.
+    - Private block ``MEDIMGKIT`` (0009,0010) with element (0009,1001):
+      a JSON array ``[{"frame": 0, "sop_instance_uid": "...", "filepath": "..."}, ...]``
+      that maps assembled frame index → original file path on disk.
+    - ``DerivationDescription`` (0008,2111): human-readable provenance note
+      (written only when the tag is not already populated).
+    """
+    # 1. Top-level SourceImageSequence (0008,2112)
+    source_image_seq = []
+    for ds in all_dicoms:
+        sop_class = ds.get('SOPClassUID')
+        sop_instance = ds.get('SOPInstanceUID')
+        if sop_class and sop_instance:
+            ref_item = pydicom.Dataset()
+            ref_item.ReferencedSOPClassUID = sop_class
+            ref_item.ReferencedSOPInstanceUID = sop_instance
+            source_image_seq.append(ref_item)
+    if source_image_seq:
+        merged_ds.SourceImageSequence = pydicom.Sequence(source_image_seq)
+
+    # 2. Per-frame DerivationImageSequence inside PerFrameFunctionalGroupsSequence
+    perframe_seq = merged_ds.get('PerFrameFunctionalGroupsSequence')
+    if perframe_seq is not None and len(perframe_seq) == len(all_dicoms):
+        for per_frame_ds, src_ds in zip(perframe_seq, all_dicoms):
+            sop_class = src_ds.get('SOPClassUID')
+            sop_instance = src_ds.get('SOPInstanceUID')
+            if sop_class and sop_instance:
+                src_ref = pydicom.Dataset()
+                src_ref.ReferencedSOPClassUID = sop_class
+                src_ref.ReferencedSOPInstanceUID = sop_instance
+                deriv_item = pydicom.Dataset()
+                deriv_item.SourceImageSequence = pydicom.Sequence([src_ref])
+                per_frame_ds.DerivationImageSequence = pydicom.Sequence([deriv_item])
+
+    # 3. Private block "MEDIMGKIT": slice-index → filepath + SOPInstanceUID mapping
+    #    (0009,0010) LO = private creator name   → reserves block 0x10
+    #    (0009,1001) UT = JSON mapping array      → block 0x10, element 0x01
+    mapping = [
+        {
+            "frame": i,
+            "sop_instance_uid": str(src_ds.get('SOPInstanceUID', '')),
+            "filepath": str(getattr(src_ds, 'filename', '') or ''),
+        }
+        for i, src_ds in enumerate(all_dicoms)
+    ]
+    merged_ds.add_new((0x0009, 0x0010), 'LO', 'MEDIMGKIT')
+    merged_ds.add_new((0x0009, 0x1001), 'UT', json.dumps(mapping))
+
+    # 4. DerivationDescription (0008,2111)
+    if not merged_ds.get('DerivationDescription'):
+        merged_ds.DerivationDescription = (
+            f"Assembled from {len(all_dicoms)} single-frame DICOMs "
+            "by medimgkit.dicom_utils.assemble_dicoms"
+        )
+
+
 def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
                             return_as_IO: bool = False
                             ) -> Generator[pydicom.Dataset, None, None] | Generator[BytesIO, None, None]:
@@ -855,6 +921,13 @@ def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
             if hasattr(merged_dicom, attr):
                 if not all(ds.get(attr) == merged_dicom.get(attr) for ds in dicoms):
                     delattr(merged_dicom, attr)
+
+        # Mark image as derived and attach source provenance metadata
+        image_type = list(merged_dicom.get('ImageType', ['ORIGINAL', 'PRIMARY']))
+        if image_type and image_type[0] != 'DERIVED':
+            image_type[0] = 'DERIVED'
+            merged_dicom.ImageType = image_type
+        _add_source_metadata(merged_dicom, dicoms)
 
         # Try to compress the assembled DICOM with JPEG-LS Lossless.
         # Falls back to uncompressed (ImplicitVRLittleEndian) if compression fails.
