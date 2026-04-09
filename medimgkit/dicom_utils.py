@@ -1,4 +1,5 @@
 from pydicom import dcmread
+from pydicom.filereader import data_element_generator, read_preamble
 from pydicom.pixels.utils import pixel_array
 import pydicom
 import pydicom.datadict
@@ -7,8 +8,8 @@ import pydicom.uid
 import pydicom.errors
 import pydicom.multival
 from pydicom.misc import is_dicom as pydicom_is_dicom
-from typing import IO, TypeVar, Generic, Literal
-from collections.abc import Sequence, Generator
+from typing import IO, BinaryIO, TypeVar, Generic, Literal, cast
+from collections.abc import Sequence, Generator, Callable
 import warnings
 from copy import deepcopy
 from datetime import datetime
@@ -33,6 +34,9 @@ _LOGGER = logging.getLogger(__name__)
 
 CLEARED_STR = "CLEARED_BY_DATAMINT"
 REPORT_MODALITIES = {'SR', 'DOC', 'KO', 'PR', 'ESR'}
+_TRANSFER_SYNTAX_UID_TAG = Tag(0x0002, 0x0010)
+_MODALITY_TAG = Tag(0x0008, 0x0060)
+_FAST_DICOM_SCAN_FALLBACK = object()
 
 
 class InconsistentDICOMFramesError(ValueError):
@@ -2061,6 +2065,63 @@ def convert_slice_location_to_slice_index_from_dicom(ds: pydicom.Dataset,
     return slice_index, slice_axis
 
 
+def _normalize_dicom_code_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode('ascii', errors='ignore')
+    normalized = str(value).strip(' \0').upper()
+    return normalized or None
+
+
+def _read_specific_dicom_tag(fp: BinaryIO,
+                             *,
+                             tag: BaseTag,
+                             is_implicit_vr: bool,
+                             is_little_endian: bool,
+                             stop_when: Callable[[BaseTag, str | None, int], bool] | None = None) -> object:
+    for element in data_element_generator(
+        fp,
+        is_implicit_VR=is_implicit_vr,
+        is_little_endian=is_little_endian,
+        stop_when=stop_when,
+        specific_tags=[tag],
+    ):
+        if element.tag == tag:
+            return element.value
+    return None
+
+
+def _read_dicom_modality_fast(fp: BinaryIO) -> str | None | object:
+    read_preamble(fp, force=False)
+
+    transfer_syntax_uid = _read_specific_dicom_tag(
+        fp,
+        tag=_TRANSFER_SYNTAX_UID_TAG,
+        is_implicit_vr=False,
+        is_little_endian=True,
+        stop_when=lambda tag, vr, length: tag.group != 0x0002,
+    )
+    if transfer_syntax_uid is None:
+        return _FAST_DICOM_SCAN_FALLBACK
+
+    transfer_syntax_uid_value = _normalize_dicom_code_string(transfer_syntax_uid)
+    if transfer_syntax_uid_value is None:
+        return _FAST_DICOM_SCAN_FALLBACK
+    transfer_syntax_uid = pydicom.uid.UID(transfer_syntax_uid_value)
+    if transfer_syntax_uid.is_deflated:
+        return _FAST_DICOM_SCAN_FALLBACK
+
+    modality = _read_specific_dicom_tag(
+        fp,
+        tag=_MODALITY_TAG,
+        is_implicit_vr=transfer_syntax_uid.is_implicit_VR,
+        is_little_endian=transfer_syntax_uid.is_little_endian,
+        stop_when=lambda tag, vr, length: tag > _MODALITY_TAG,
+    )
+    return _normalize_dicom_code_string(modality)
+
+
 def is_dicom_report(file_path: str | IO) -> bool:
     """
     Check if a DICOM file is a report (e.g., Structured Report).
@@ -2072,24 +2133,33 @@ def is_dicom_report(file_path: str | IO) -> bool:
         bool: True if the DICOM file is a report, False otherwise.
     """
     try:
-        if not is_dicom(file_path):
-            return False
-
         if is_io_object(file_path):
-            with peek(file_path):
-                ds = pydicom.dcmread(file_path,
+            file_obj = cast(BinaryIO, file_path)
+            start_pos = file_obj.tell()
+            with peek(file_obj):
+                modality = _read_dicom_modality_fast(file_obj)
+                if modality is _FAST_DICOM_SCAN_FALLBACK:
+                    file_obj.seek(start_pos)
+                    ds = pydicom.dcmread(file_obj,
+                                         specific_tags=['Modality'],
+                                         stop_before_pixels=True)
+                    modality = _normalize_dicom_code_string(getattr(ds, 'Modality', None))
+        else:
+            path = Path(cast(str, file_path))
+            with path.open('rb') as dicom_file:
+                modality = _read_dicom_modality_fast(dicom_file)
+            if modality is _FAST_DICOM_SCAN_FALLBACK:
+                ds = pydicom.dcmread(path,
                                      specific_tags=['Modality'],
                                      stop_before_pixels=True)
-        else:
-            ds = pydicom.dcmread(file_path,
-                                 specific_tags=['Modality'],
-                                 stop_before_pixels=True)
-        modality = getattr(ds, 'Modality', None)
+                modality = _normalize_dicom_code_string(getattr(ds, 'Modality', None))
 
         # Common report modalities
         # SR=Structured Report, DOC=Document, KO=Key Object, PR=Presentation State
 
         return modality in REPORT_MODALITIES
+    except pydicom.errors.InvalidDicomError:
+        return False
     except Exception as e:
         _LOGGER.warning(f"Error checking if DICOM is a report: {e}")
         return False

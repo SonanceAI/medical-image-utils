@@ -5,10 +5,9 @@ import numpy as np
 import json
 from pydicom.dataset import FileDataset, FileMetaDataset
 
-from medimgkit.dicom_utils import assemble_dicoms, anonymize_dicom, CLEARED_STR, is_dicom, TokenMapper, build_affine_matrix
+from medimgkit.dicom_utils import assemble_dicoms, anonymize_dicom, CLEARED_STR, is_dicom, is_dicom_report, TokenMapper, build_affine_matrix
 import pydicom.data
 from io import BytesIO
-import warnings
 
 class TestDicomUtils:
     def _write_single_frame_dicom(self,
@@ -114,6 +113,53 @@ class TestDicomUtils:
 
         ## test empty data ##
         assert is_dicom(BytesIO()) == False
+
+    def test_is_dicom_report_from_path(self, tmp_path):
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.BasicTextSRStorage
+        file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+        file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+        file_path = tmp_path / 'report_sr.dcm'
+        ds = FileDataset(str(file_path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+        ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
+        ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        ds.Modality = 'SR'
+        ds.PatientName = 'Report^Patient'
+        ds.PatientID = 'SR123'
+        ds.save_as(str(file_path), enforce_file_format=True)
+
+        assert is_dicom_report(str(file_path)) is True
+
+    def test_is_dicom_report_from_io_preserves_position(self, tmp_path):
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.CTImageStorage
+        file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+        file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
+
+        file_path = tmp_path / 'image_ct.dcm'
+        ds = FileDataset(str(file_path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+        ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
+        ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        ds.Modality = 'CT'
+        ds.PatientName = 'Image^Patient'
+        ds.PatientID = 'CT123'
+        ds.save_as(str(file_path), enforce_file_format=True)
+
+        with open(file_path, 'rb') as source_file:
+            payload = source_file.read()
+
+        file_obj = BytesIO(payload)
+        file_obj.seek(7)
+
+        assert is_dicom_report(file_obj) is False
+        assert file_obj.tell() == 7
+
+    def test_is_dicom_report_rejects_non_dicom(self, tmp_path):
+        text_file = tmp_path / 'not_a_dicom.txt'
+        text_file.write_text('plain text')
+
+        assert is_dicom_report(str(text_file)) is False
 
     @pytest.fixture
     def complex_dataset(self):
