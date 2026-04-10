@@ -444,6 +444,7 @@ class TestDicomUtils:
         )
 
         merged = next(iter(assemble_dicoms([path1, path2], progress_bar=False)))
+        assert isinstance(merged, pydicom.Dataset)
 
         assert merged.SOPClassUID == pydicom.uid.LegacyConvertedEnhancedCTImageStorage
         assert merged.file_meta.MediaStorageSOPClassUID == merged.SOPClassUID
@@ -516,6 +517,7 @@ class TestDicomUtils:
         )
 
         merged = next(iter(assemble_dicoms([path1, path2], progress_bar=False)))
+        assert isinstance(merged, pydicom.Dataset)
 
         medimgkit_block = merged.private_block(0x0009, 'MEDIMGKIT')
         perframe_private_ds = merged.PerFrameFunctionalGroupsSequence[0].UnassignedPerFrameConvertedAttributesSequence[0]
@@ -523,3 +525,51 @@ class TestDicomUtils:
 
         assert medimgkit_block.get_tag(0x01) in merged
         assert perframe_private_ds[existing_block.get_tag(0x01)].value in {'sentinel', b'sentinel'}
+
+    def test_assemble_dicoms_reads_metadata_before_materializing_groups(self, tmp_path, monkeypatch):
+        original_series_uid = '1.2.826.0.1.3680043.8.498.202'
+        path1 = self._write_single_frame_dicom(
+            tmp_path,
+            'slice1_metadata_only.dcm',
+            1,
+            1,
+            '1.2.826.0.1.3680043.8.498.3001',
+            original_series_uid,
+            '090100.000000',
+        )
+        path2 = self._write_single_frame_dicom(
+            tmp_path,
+            'slice2_metadata_only.dcm',
+            2,
+            2,
+            '1.2.826.0.1.3680043.8.498.3002',
+            original_series_uid,
+            '090200.000000',
+        )
+
+        original_dcmread = pydicom.dcmread
+        read_calls: list[dict[str, object]] = []
+
+        def tracking_dcmread(*args, **kwargs):
+            read_calls.append({
+                'stop_before_pixels': kwargs.get('stop_before_pixels', False),
+                'specific_tags': kwargs.get('specific_tags'),
+            })
+            return original_dcmread(*args, **kwargs)
+
+        monkeypatch.setattr(pydicom, 'dcmread', tracking_dcmread)
+
+        assembled = assemble_dicoms([path1, path2], progress_bar=False)
+
+        assert len(assembled) == 1
+        assert len(read_calls) == 2
+        assert all(call['stop_before_pixels'] is True for call in read_calls)
+        assert all(call['specific_tags'] is not None for call in read_calls)
+
+        merged = assembled[0]
+        assert isinstance(merged, pydicom.Dataset)
+
+        assert merged.NumberOfFrames == 2
+        assert len(read_calls) == 4
+        assert all(call['stop_before_pixels'] is True for call in read_calls[:2])
+        assert all(call['stop_before_pixels'] is False for call in read_calls[2:])

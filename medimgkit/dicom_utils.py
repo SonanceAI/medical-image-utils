@@ -37,11 +37,110 @@ REPORT_MODALITIES = {'SR', 'DOC', 'KO', 'PR', 'ESR'}
 _TRANSFER_SYNTAX_UID_TAG = Tag(0x0002, 0x0010)
 _MODALITY_TAG = Tag(0x0008, 0x0060)
 _FAST_DICOM_SCAN_FALLBACK = object()
+_ASSEMBLE_INTERNAL_METADATA_TAGS = (
+    'Columns',
+    'FrameLaterality',
+    'FrameOfReferenceUID',
+    'ImageLaterality',
+    'ImageOrientationPatient',
+    'ImagePositionPatient',
+    'ImageType',
+    'InstanceNumber',
+    'Laterality',
+    'Modality',
+    'NumberOfFrames',
+    'NumberOfSlices',
+    'ProtocolName',
+    'Rows',
+    'SeriesDescription',
+    'SeriesInstanceUID',
+    'StudyInstanceUID',
+)
+_ASSEMBLY_METADATA_OVERRIDE_TAGS = (
+    'FrameLaterality',
+    'ImageLaterality',
+    'Laterality',
+)
 
 
 class InconsistentDICOMFramesError(ValueError):
     """Raised when DICOM frames have inconsistent geometry that prevents building a single affine matrix."""
     pass
+
+
+class _AssembleDicomSource:
+    def __init__(self,
+                 source: str | IO,
+                 metadata: pydicom.Dataset,
+                 source_offset: int | None = None):
+        self.source = source
+        self.metadata = metadata
+        self.source_offset = source_offset
+
+    def load(self) -> pydicom.Dataset:
+        try:
+            if is_io_object(self.source):
+                io_source = cast(IO, self.source)
+                with peek(io_source):
+                    if self.source_offset is not None:
+                        io_source.seek(self.source_offset)
+                    dicom = pydicom.dcmread(io_source)
+            else:
+                dicom = pydicom.dcmread(self.source)
+        except pydicom.errors.InvalidDicomError as e:
+            _add_source_name_to_invalid_dicom_error(e, self.source)
+            raise
+
+        _apply_assembly_metadata_overrides(dicom, self.metadata)
+        return dicom
+
+
+def _add_source_name_to_invalid_dicom_error(error: pydicom.errors.InvalidDicomError,
+                                            source: str | IO) -> None:
+    if isinstance(source, str):
+        name = source
+    elif hasattr(source, 'name'):
+        name = source.name
+    else:
+        name = None
+    if name:
+        error.args = tuple(list(error.args) + [f"File: {name}"])
+
+
+def _apply_assembly_metadata_overrides(ds: pydicom.Dataset,
+                                       metadata_ds: pydicom.Dataset) -> None:
+    for tag_name in _ASSEMBLY_METADATA_OVERRIDE_TAGS:
+        if tag_name in metadata_ds:
+            setattr(ds, tag_name, deepcopy(metadata_ds.get(tag_name)))
+        elif tag_name in ds:
+            delattr(ds, tag_name)
+
+
+def _get_assemble_specific_tags(groupby_tags: Sequence[str]) -> list[str]:
+    return sorted(set(groupby_tags) | set(_ASSEMBLE_INTERNAL_METADATA_TAGS))
+
+
+def _read_dicom_metadata_for_assembly(source: str | IO,
+                                      specific_tags: Sequence[str]) -> _AssembleDicomSource:
+    source_offset: int | None = None
+
+    try:
+        if is_io_object(source):
+            io_source = cast(IO, source)
+            source_offset = io_source.tell()
+            with peek(io_source):
+                dicom = pydicom.dcmread(io_source,
+                                        stop_before_pixels=True,
+                                        specific_tags=list(specific_tags))
+        else:
+            dicom = pydicom.dcmread(source,
+                                    stop_before_pixels=True,
+                                    specific_tags=list(specific_tags))
+    except pydicom.errors.InvalidDicomError as e:
+        _add_source_name_to_invalid_dicom_error(e, source)
+        raise
+
+    return _AssembleDicomSource(source, dicom, source_offset)
 
 
 def set_cleared_string(value: str):
@@ -649,25 +748,43 @@ def get_dicom_laterality(ds: pydicom.Dataset) -> str | None:
     return ds.get('Laterality')
 
 
-class AssembledDICOMsResult(GeneratorWithLength):
+class AssembledDICOMsResult:
     """
+    Lazily assembled DICOM result that supports efficient random access.
+
+    ``result[i]`` merges and returns only the i-th assembled DICOM without
+    processing any other group. Already-computed entries are cached so that
+    repeated access is free.
+
     mapping_idx: A sequence of lists of indices. The `mapping_idx[i]` contains the indices of the original DICOMs
         that were used to create the i-th assembled DICOM.
 
     inverse_mapping_idx: A list of indices. The `inverse_mapping_idx[j]` gives the index of the assembled DICOM
         that corresponds to the original DICOM at index j.
-
     """
 
-    # declare attributes
     mapping_idx: Sequence[list[int]]
-    inverse_mapping_idx: list[int]
 
     def __init__(self,
-                 generator: GeneratorWithLength[pydicom.Dataset | IO],
-                 mapping_idx: Sequence[list[int]]):
-        super().__init__(generator.generator, generator.length)
+                 groups: list[list[_AssembleDicomSource]],
+                 mapping_idx: Sequence[list[int]],
+                 return_as_IO: bool = False):
+        self._groups = groups
+        self._return_as_IO = return_as_IO
+        self._cache: dict[int, pydicom.Dataset | BytesIO] = {}
         self.mapping_idx = mapping_idx
+
+    def __len__(self) -> int:
+        return len(self._groups)
+
+    def __getitem__(self, i: int) -> pydicom.Dataset | BytesIO:
+        if i not in self._cache:
+            self._cache[i] = _merge_single_group(self._groups[i], self._return_as_IO)
+        return self._cache[i]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
 
     @property
     def inverse_mapping_idx(self) -> list[int]:
@@ -710,8 +827,9 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
     Returns:
         A generator that yields the merged DICOM files.
     """
-    dicoms_map = defaultdict(list)
-    dicom_list = []
+    dicom_list: list[pydicom.Dataset] = []
+    dicom_sources: list[_AssembleDicomSource] = []
+    metadata_tags = _get_assemble_specific_tags(groupby_tags)
 
     if progress_bar:
         from tqdm.auto import tqdm
@@ -720,25 +838,9 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
         iterable = files_path
 
     for file_path in iterable:
-        try:
-            if is_io_object(file_path):
-                with peek(file_path):
-                    dicom = pydicom.dcmread(file_path)
-            else:
-                dicom = pydicom.dcmread(file_path)
-            dicom_list.append(dicom)
-        except pydicom.errors.InvalidDicomError as e:
-            # Add file path to error message
-            if isinstance(file_path, str):
-                name = file_path
-            elif hasattr(file_path, 'name'):
-                name = file_path.name
-            else:
-                name = None
-            if name:
-                e.args = tuple(list(e.args) + [f"File: {name}"])
-            # raise it
-            raise
+        dicom_source = _read_dicom_metadata_for_assembly(file_path, metadata_tags)
+        dicom_sources.append(dicom_source)
+        dicom_list.append(dicom_source.metadata)
 
     if infer_laterality:
         ### infer laterality and update tag if necessary ###
@@ -798,11 +900,10 @@ def assemble_dicoms(files_path: Sequence[str] | Sequence[IO],
 
     dicoms_map_idxs = _group_dicoms_by_tags(dicom_list, groupby_tags,
                                             return_indices=True)
-    dicoms_map = {k: [dicom_list[i] for i in v] for k, v in dicoms_map_idxs.items()}
-
-    gen = _generate_merged_dicoms(dicoms_map, return_as_IO=return_as_IO)
-    return AssembledDICOMsResult(GeneratorWithLength(gen, len(dicoms_map)),
-                                 list(dicoms_map_idxs.values()))
+    groups = [[dicom_sources[i] for i in indices] for indices in dicoms_map_idxs.values()]
+    return AssembledDICOMsResult(groups,
+                                 list(dicoms_map_idxs.values()),
+                                 return_as_IO=return_as_IO)
 
 
 def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
@@ -1063,128 +1164,131 @@ def _add_source_metadata(merged_ds: pydicom.Dataset,
         )
 
 
-def _generate_merged_dicoms(dicoms_map: dict[str, list[pydicom.Dataset]],
-                            return_as_IO: bool = False
-                            ) -> Generator[pydicom.Dataset, None, None] | Generator[BytesIO, None, None]:
-    for _, dicoms in dicoms_map.items():
-        dicoms.sort(key=lambda ds: 0 if ds.get('InstanceNumber') is None else ds.get('InstanceNumber'))
-        source_metadata = _collect_source_metadata(dicoms)
-        source_unassigned_elements = [_get_unassigned_converted_elements(ds) for ds in dicoms]
-        source_contributing_equipment_sequences = [
-            deepcopy(ds.ContributingEquipmentSequence) if ds.get('ContributingEquipmentSequence') else None
-            for ds in dicoms
-        ]
-        # Use the first dicom as a template
-        merged_dicom = dicoms[0]
-        if len(dicoms) == 1:
-            if return_as_IO:
-                # generate base name
-                base_name = _generate_dicom_name(merged_dicom)
-                # include original absolute path if available
-                original_path = getattr(dicoms[0], 'filename', None)
-                if original_path:
-                    name = os.path.join(os.path.abspath(original_path), base_name)
-                else:
-                    name = base_name
-                yield to_bytesio(merged_dicom, name=name)
-            else:
-                yield merged_dicom
-            continue
-
-        # Combine pixel data
-        # check if all dicoms have the same Rows and Columns. Raise error if not with details.
-        first_rows = dicoms[0].Rows
-        first_cols = dicoms[0].Columns
-        for ds in dicoms[1:]:
-            if ds.Rows != first_rows or ds.Columns != first_cols:
-                raise ValueError(f"Cannot merge DICOMs with different Rows and Columns: "
-                                 f"{dicoms[0].SOPInstanceUID} has ({first_rows}, {first_cols}), "
-                                 f"but {ds.SOPInstanceUID} has ({ds.Rows}, {ds.Columns}).")
-        pixel_arrays = np.stack([ds.pixel_array for ds in dicoms], axis=0)
-
-        # Update the merged dicom
-        merged_dicom.PixelData = pixel_arrays.tobytes()
-        target_sop_class_uid = _get_legacy_converted_sop_class_uid(merged_dicom)
-        if target_sop_class_uid is not None and target_sop_class_uid != merged_dicom.get('SOPClassUID'):
-            _LOGGER.info(f"Converting assembled DICOM SOP Class UID to {target_sop_class_uid}.")
-            merged_dicom.SOPClassUID = pydicom.uid.UID(str(target_sop_class_uid))
-        merged_dicom.NumberOfFrames = len(pixel_arrays)  # Set number of frames
-        merged_dicom.SOPInstanceUID = pydicom.uid.generate_uid()  # Generate new SOP Instance UID
-        merged_dicom.SeriesInstanceUID = pydicom.uid.generate_uid()
-        merged_dicom.file_meta.MediaStorageSOPInstanceUID = merged_dicom.SOPInstanceUID
-        merged_dicom.file_meta.MediaStorageSOPClassUID = pydicom.uid.UID(str(merged_dicom.SOPClassUID))
-        # Removed deprecated attributes and set Transfer Syntax UID instead:
-        merged_dicom.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
-        _remove_concatenation_attributes(merged_dicom)
-        _set_series_date_and_time_from_sources(merged_dicom, dicoms)
-        _set_instance_creation_timestamps(merged_dicom)
-
-        # Free up memory
-        for ds in dicoms[1:]:
-            del ds.PixelData
-
-        # create multi-frame attributes
-        # check if FramTime is equal for all dicoms
-        frame_time = merged_dicom.get('FrameTime', None)
-        all_frame_time_equal = all(ds.get('FrameTime', None) == frame_time for ds in dicoms)
-        if frame_time is not None and all_frame_time_equal:
-            merged_dicom.FrameTime = frame_time  # (0x0018,0x1063)
-            merged_dicom.FrameIncrementPointer = (0x0018, 0x1063)  # points to 'FrameTime'
-        else:
-            # TODO: Sometimes FrameTime is present but not equal for all dicoms. In this case, check out 'FrameTimeVector'.
-            merged_dicom = _create_multiframe_attributes(merged_dicom, dicoms)
-
-        # add comment tag about merging
-        comment = f"Merged {len(dicoms)} DICOM files into a single DICOM by medimgkit.dicom_utils.assemble_dicoms"
-        if hasattr(merged_dicom, 'ImageComments') and merged_dicom.ImageComments:
-            merged_dicom.ImageComments += " | " + comment
-        else:
-            merged_dicom.ImageComments = comment
-
-        # Remove tags of single frame dicoms
-        for attr in ['ImagePositionPatient', 'SliceLocation', 'ImageOrientationPatient',
-                     'PixelSpacing', 'SpacingBetweenSlices', 'InstanceNumber']:
-            # remove only if they are not all equal
-            if hasattr(merged_dicom, attr):
-                if not all(ds.get(attr) == merged_dicom.get(attr) for ds in dicoms):
-                    delattr(merged_dicom, attr)
-
-        # Mark image as derived and attach source provenance metadata
-        image_type = list(merged_dicom.get('ImageType', ['ORIGINAL', 'PRIMARY']))
-        if image_type and image_type[0] != 'DERIVED':
-            image_type[0] = 'DERIVED'
-            merged_dicom.ImageType = image_type
-        _add_legacy_conversion_metadata(
-            merged_dicom,
-            source_metadata,
-            source_unassigned_elements,
-            source_contributing_equipment_sequences,
-        )
-        _add_source_metadata(merged_dicom, source_metadata)
-
-        # Try to compress the assembled DICOM with JPEG-LS Lossless.
-        # Falls back to uncompressed (ImplicitVRLittleEndian) if compression fails.
-        try:
-            merged_dicom.compress(JPEGLSLossless)
-        except Exception as e:
-            _LOGGER.warning(
-                f"Could not compress assembled DICOM with JPEG-LS Lossless: {e}. "
-                "Falling back to uncompressed."
-            )
-
+def _merge_single_group(dicom_sources: list[_AssembleDicomSource],
+                        return_as_IO: bool = False
+                        ) -> pydicom.Dataset | BytesIO:
+    sorted_sources = sorted(
+        dicom_sources,
+        key=lambda source: 0 if source.metadata.get('InstanceNumber') is None else source.metadata.get('InstanceNumber')
+    )
+    dicoms = [source.load() for source in sorted_sources]
+    dicoms.sort(key=lambda ds: 0 if ds.get('InstanceNumber') is None else ds.get('InstanceNumber'))
+    source_metadata = _collect_source_metadata(dicoms)
+    source_unassigned_elements = [_get_unassigned_converted_elements(ds) for ds in dicoms]
+    source_contributing_equipment_sequences = [
+        deepcopy(ds.ContributingEquipmentSequence) if ds.get('ContributingEquipmentSequence') else None
+        for ds in dicoms
+    ]
+    # Use the first dicom as a template
+    merged_dicom = dicoms[0]
+    if len(dicoms) == 1:
         if return_as_IO:
             # generate base name
             base_name = _generate_dicom_name(merged_dicom)
-            # include original absolute path from first input dataset
+            # include original absolute path if available
             original_path = getattr(dicoms[0], 'filename', None)
             if original_path:
-                name = os.path.dirname(os.path.abspath(original_path))
-                name = os.path.join(name, base_name)
+                name = os.path.join(os.path.abspath(original_path), base_name)
             else:
                 name = base_name
-            yield to_bytesio(merged_dicom, name=name)
+            return to_bytesio(merged_dicom, name=name)
         else:
-            yield merged_dicom
+            return merged_dicom
+
+    # Combine pixel data
+    # check if all dicoms have the same Rows and Columns. Raise error if not with details.
+    first_rows = dicoms[0].Rows
+    first_cols = dicoms[0].Columns
+    for ds in dicoms[1:]:
+        if ds.Rows != first_rows or ds.Columns != first_cols:
+            raise ValueError(f"Cannot merge DICOMs with different Rows and Columns: "
+                             f"{dicoms[0].SOPInstanceUID} has ({first_rows}, {first_cols}), "
+                             f"but {ds.SOPInstanceUID} has ({ds.Rows}, {ds.Columns}).")
+    pixel_arrays = np.stack([ds.pixel_array for ds in dicoms], axis=0)
+
+    # Update the merged dicom
+    merged_dicom.PixelData = pixel_arrays.tobytes()
+    target_sop_class_uid = _get_legacy_converted_sop_class_uid(merged_dicom)
+    if target_sop_class_uid is not None and target_sop_class_uid != merged_dicom.get('SOPClassUID'):
+        _LOGGER.info(f"Converting assembled DICOM SOP Class UID to {target_sop_class_uid}.")
+        merged_dicom.SOPClassUID = pydicom.uid.UID(str(target_sop_class_uid))
+    merged_dicom.NumberOfFrames = len(pixel_arrays)  # Set number of frames
+    merged_dicom.SOPInstanceUID = pydicom.uid.generate_uid()  # Generate new SOP Instance UID
+    merged_dicom.SeriesInstanceUID = pydicom.uid.generate_uid()
+    merged_dicom.file_meta.MediaStorageSOPInstanceUID = merged_dicom.SOPInstanceUID
+    merged_dicom.file_meta.MediaStorageSOPClassUID = pydicom.uid.UID(str(merged_dicom.SOPClassUID))
+    # Removed deprecated attributes and set Transfer Syntax UID instead:
+    merged_dicom.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
+    _remove_concatenation_attributes(merged_dicom)
+    _set_series_date_and_time_from_sources(merged_dicom, dicoms)
+    _set_instance_creation_timestamps(merged_dicom)
+
+    # Free up memory
+    for ds in dicoms[1:]:
+        del ds.PixelData
+
+    # create multi-frame attributes
+    # check if FramTime is equal for all dicoms
+    frame_time = merged_dicom.get('FrameTime', None)
+    all_frame_time_equal = all(ds.get('FrameTime', None) == frame_time for ds in dicoms)
+    if frame_time is not None and all_frame_time_equal:
+        merged_dicom.FrameTime = frame_time  # (0x0018,0x1063)
+        merged_dicom.FrameIncrementPointer = (0x0018, 0x1063)  # points to 'FrameTime'
+    else:
+        # TODO: Sometimes FrameTime is present but not equal for all dicoms. In this case, check out 'FrameTimeVector'.
+        merged_dicom = _create_multiframe_attributes(merged_dicom, dicoms)
+
+    # add comment tag about merging
+    comment = f"Merged {len(dicoms)} DICOM files into a single DICOM by medimgkit.dicom_utils.assemble_dicoms"
+    if hasattr(merged_dicom, 'ImageComments') and merged_dicom.ImageComments:
+        merged_dicom.ImageComments += " | " + comment
+    else:
+        merged_dicom.ImageComments = comment
+
+    # Remove tags of single frame dicoms
+    for attr in ['ImagePositionPatient', 'SliceLocation', 'ImageOrientationPatient',
+                 'PixelSpacing', 'SpacingBetweenSlices', 'InstanceNumber']:
+        # remove only if they are not all equal
+        if hasattr(merged_dicom, attr):
+            if not all(ds.get(attr) == merged_dicom.get(attr) for ds in dicoms):
+                delattr(merged_dicom, attr)
+
+    # Mark image as derived and attach source provenance metadata
+    image_type = list(merged_dicom.get('ImageType', ['ORIGINAL', 'PRIMARY']))
+    if image_type and image_type[0] != 'DERIVED':
+        image_type[0] = 'DERIVED'
+        merged_dicom.ImageType = image_type
+    _add_legacy_conversion_metadata(
+        merged_dicom,
+        source_metadata,
+        source_unassigned_elements,
+        source_contributing_equipment_sequences,
+    )
+    _add_source_metadata(merged_dicom, source_metadata)
+
+    # Try to compress the assembled DICOM with JPEG-LS Lossless.
+    # Falls back to uncompressed (ImplicitVRLittleEndian) if compression fails.
+    try:
+        merged_dicom.compress(JPEGLSLossless)
+    except Exception as e:
+        _LOGGER.warning(
+            f"Could not compress assembled DICOM with JPEG-LS Lossless: {e}. "
+            "Falling back to uncompressed."
+        )
+
+    if return_as_IO:
+        # generate base name
+        base_name = _generate_dicom_name(merged_dicom)
+        # include original absolute path from first input dataset
+        original_path = getattr(dicoms[0], 'filename', None)
+        if original_path:
+            name = os.path.dirname(os.path.abspath(original_path))
+            name = os.path.join(name, base_name)
+        else:
+            name = base_name
+        return to_bytesio(merged_dicom, name=name)
+    else:
+        return merged_dicom
 
 
 """
