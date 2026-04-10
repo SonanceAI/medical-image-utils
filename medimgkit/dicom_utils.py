@@ -2226,7 +2226,7 @@ def _read_dicom_modality_fast(fp: BinaryIO) -> str | None | object:
     return _normalize_dicom_code_string(modality)
 
 
-def is_dicom_report(file_path: str | IO) -> bool:
+def is_dicom_report(file_path: str | IO | pydicom.Dataset) -> bool:
     """
     Check if a DICOM file is a report (e.g., Structured Report).
 
@@ -2248,6 +2248,8 @@ def is_dicom_report(file_path: str | IO) -> bool:
                                          specific_tags=['Modality'],
                                          stop_before_pixels=True)
                     modality = _normalize_dicom_code_string(getattr(ds, 'Modality', None))
+        elif isinstance(file_path, pydicom.Dataset):
+            modality = _normalize_dicom_code_string(getattr(file_path, 'Modality', None))
         else:
             path = Path(cast(str, file_path))
             with path.open('rb') as dicom_file:
@@ -2260,7 +2262,6 @@ def is_dicom_report(file_path: str | IO) -> bool:
 
         # Common report modalities
         # SR=Structured Report, DOC=Document, KO=Key Object, PR=Presentation State
-
         return modality in REPORT_MODALITIES
     except pydicom.errors.InvalidDicomError:
         return False
