@@ -921,6 +921,7 @@ def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
     to_check_tags = [('ImagePositionPatient', 'PlanePositionSequence'),
                      ('PixelSpacing', 'PixelMeasuresSequence'),
                      ('SpacingBetweenSlices', 'PixelMeasuresSequence'),
+                     ('SliceThickness', 'PixelMeasuresSequence'),
                      ('ImageOrientationPatient', 'PlaneOrientationSequence')]
 
     for tag, where_to_put in to_check_tags:
@@ -940,6 +941,7 @@ def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
         _LOGGER.info("Merged DICOM already has PerFrameFunctionalGroupsSequence. It will be overwritten.")
 
     perframe_seq_list = []
+    has_perframe_content = False
     for ds in all_dicoms:
         per_frame_dataset = pydicom.Dataset()  # root dataset for each frame
         for tag, where_to_put in to_check_tags:
@@ -951,13 +953,20 @@ def _create_multiframe_attributes(merged_ds: pydicom.Dataset,
             if per_frame_dataset.get(where_to_put) is None:
                 per_frame_dataset.__setattr__(where_to_put, pydicom.Sequence([pydicom.Dataset()]))
             per_frame_dataset.get(where_to_put)[0].__setattr__(tag, ds.get(tag))
+        if len(per_frame_dataset) > 0:
+            has_perframe_content = True
         perframe_seq_list.append(per_frame_dataset)
-    if len(perframe_seq_list) > 0:
+    if has_perframe_content:
         if len(perframe_seq_list) != len(all_dicoms):
             raise ValueError(
                 f"Number of PerFrameFunctionalGroupsSequence items ({len(perframe_seq_list)}) does not match number of frames ({len(all_dicoms)}) for {merged_ds.AccessionNumber}")
         merged_ds.PerFrameFunctionalGroupsSequence = pydicom.Sequence(perframe_seq_list)
         merged_ds.FrameIncrementPointer = (0x5200, 0x9230)
+    else:
+        if 'PerFrameFunctionalGroupsSequence' in merged_ds:
+            del merged_ds.PerFrameFunctionalGroupsSequence
+        if 'FrameIncrementPointer' in merged_ds:
+            del merged_ds.FrameIncrementPointer
 
     return merged_ds
 

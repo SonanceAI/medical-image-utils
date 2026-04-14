@@ -5,7 +5,16 @@ import numpy as np
 import json
 from pydicom.dataset import FileDataset, FileMetaDataset
 
-from medimgkit.dicom_utils import assemble_dicoms, anonymize_dicom, CLEARED_STR, is_dicom, is_dicom_report, TokenMapper, build_affine_matrix
+from medimgkit.dicom_utils import (
+    CLEARED_STR,
+    TokenMapper,
+    _create_multiframe_attributes,
+    anonymize_dicom,
+    assemble_dicoms,
+    build_affine_matrix,
+    is_dicom,
+    is_dicom_report,
+)
 import pydicom.data
 from io import BytesIO
 
@@ -419,6 +428,28 @@ class TestDicomUtils:
         with pytest.raises(ValueError):
             build_affine_matrix(ds)
 
+    def test_create_multiframe_attributes_promotes_constant_slice_thickness_to_shared(self):
+        merged = pydicom.Dataset()
+
+        source_dicoms = []
+        for _ in range(2):
+            ds = pydicom.Dataset()
+            ds.PixelSpacing = [1.0, 1.0]
+            ds.SpacingBetweenSlices = 5.0
+            ds.SliceThickness = 5.0
+            ds.ImageOrientationPatient = [1.0, 0.0, 0.0,
+                                          0.0, 1.0, 0.0]
+            source_dicoms.append(ds)
+
+        result = _create_multiframe_attributes(merged, source_dicoms)
+
+        pixel_measures = result.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0]
+        assert pixel_measures.PixelSpacing == [1.0, 1.0]
+        assert pixel_measures.SpacingBetweenSlices == '5.0'
+        assert pixel_measures.SliceThickness == '5.0'
+        assert 'PerFrameFunctionalGroupsSequence' not in result
+        assert 'FrameIncrementPointer' not in result
+
     def test_assemble_dicoms_adds_legacy_conversion_metadata(self, tmp_path):
         original_series_uid = '1.2.826.0.1.3680043.8.498.200'
         sop_uid_1 = '1.2.826.0.1.3680043.8.498.1001'
@@ -468,6 +499,9 @@ class TestDicomUtils:
         assert purpose_item.CodingSchemeDesignator == 'DCM'
         assert purpose_item.CodeMeaning == 'Enhanced Multi-frame Conversion Equipment'
         assert contributing_item.ContributionDescription == 'Legacy Enhanced Image created from Classic Images'
+
+        pixel_measures = merged.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0]
+        assert pixel_measures.SliceThickness == '5.0'
 
         shared_unassigned = merged.SharedFunctionalGroupsSequence[0].UnassignedSharedConvertedAttributesSequence[0]
         assert shared_unassigned.SeriesInstanceUID == original_series_uid
