@@ -1,19 +1,31 @@
-from nibabel.spatialimages import SpatialImage
-from nibabel.filebasedimages import ImageFileError
-import numpy as np
+from contextlib import contextmanager
+import gzip
+from io import IOBase
 import logging
 from pathlib import Path
-import nibabel as nib
-import gzip
-from contextlib import contextmanager
-from medimgkit import GZIP_MIME_TYPES, ViewPlane
 from typing import BinaryIO
+
+import numpy as np
+from nibabel.filebasedimages import ImageFileError
+from nibabel.loadsave import load as nib_load
+from nibabel.nifti1 import Nifti1Image
+from nibabel.spatialimages import SpatialImage
+import nibabel as nib
+
+from medimgkit import GZIP_MIME_TYPES, ViewPlane
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NIFTI_MIME = 'application/nifti'
 NIFTI_MIMES = ['application/x-nifti', 'image/x.nifti', 'application/nifti']
 NIFTI_EXTENSIONS = ('.nii', '.hdr')
+DEFAULT_SLICE_PLANE: ViewPlane = 'axial'
+VALID_PLANES = frozenset({'axial', 'sagittal', 'coronal'})
+_PLANE_FORWARD_CODE = {
+    'sagittal': 'R',
+    'coronal': 'A',
+    'axial': 'S',
+}
 _PLANES_TO_CODES = {
     "sagittal": {'L', 'R'},
     "coronal": {'A', 'P'},
@@ -21,26 +33,131 @@ _PLANES_TO_CODES = {
 }
 
 
+def _get_requested_plane(slice_axis: int | None,
+                         plane: ViewPlane | None,
+                         *,
+                         default_plane: ViewPlane | None = None) -> ViewPlane | None:
+    if plane is not None:
+        return plane
+    if slice_axis is None:
+        return default_plane
+    return None
+
+
+def _get_plane_axis(data: SpatialImage, plane: ViewPlane) -> int:
+    if plane not in VALID_PLANES:
+        raise ValueError(f"Invalid plane '{plane}'. Must be one of {VALID_PLANES}.")
+
+    axcodes = nib.orientations.aff2axcodes(data.affine)
+    target_codes = _PLANES_TO_CODES[plane]
+
+    for axis_index, code in enumerate(axcodes):
+        if code in target_codes:
+            return axis_index
+
+    raise RuntimeError(f"Could not map the {plane} plane from affine codes: {axcodes}")
+
+
+def _get_affine(data: SpatialImage) -> np.ndarray:
+    affine = data.affine
+    if affine is None:
+        raise ValueError("NIfTI image does not define an affine matrix")
+    return affine
+
+
+def _load_spatial_image(file_path: str | Path) -> SpatialImage:
+    return nib_load(file_path)
+
+
+def _resolve_slice_axis(data: SpatialImage,
+                        slice_axis: int | None = None,
+                        plane: ViewPlane | None = None) -> int | None:
+    if slice_axis is not None and plane is not None:
+        raise ValueError("slice_axis and plane are mutually exclusive")
+
+    if plane is not None:
+        return _get_plane_axis(data, plane)
+
+    if slice_axis is None:
+        return None
+
+    if len(data.shape) < 3:
+        raise ValueError("NIfTI image must be at least 3D to extract a slice")
+
+    if slice_axis not in (0, 1, 2):
+        raise ValueError(f"Invalid slice axis: {slice_axis}. Must be 0, 1, or 2.")
+
+    return slice_axis
+
+
+def _should_reverse_slice_order(data: SpatialImage,
+                                slice_axis: int,
+                                plane: ViewPlane | None) -> bool:
+    if plane is None:
+        return False
+
+    axcodes = nib.orientations.aff2axcodes(data.affine)
+    return axcodes[slice_axis] != _PLANE_FORWARD_CODE[plane]
+
+
+def _normalize_slice_index(slice_index: int,
+                           axis_size: int,
+                           reverse_order: bool) -> int:
+    if not 0 <= slice_index < axis_size:
+        raise ValueError(
+            f"slice_index {slice_index} is out of bounds for axis with size {axis_size}")
+
+    if reverse_order:
+        return axis_size - 1 - slice_index
+    return slice_index
+
+
+def _standardize_slice_array(imgs: np.ndarray) -> np.ndarray:
+    if imgs.ndim == 2:
+        return imgs.transpose(1, 0)[np.newaxis]
+
+    if imgs.ndim == 3:
+        return imgs.transpose(2, 1, 0)
+
+    raise ValueError(f"Unsupported slice shape: {imgs.shape}")
+
+
+def _standardize_volume_array(imgs: np.ndarray,
+                              file_path: str | Path | BinaryIO,
+                              slice_axis: int | None = None) -> np.ndarray:
+    if imgs.ndim == 2:
+        return imgs.transpose(1, 0)[np.newaxis, np.newaxis]
+
+    if imgs.ndim == 3:
+        if slice_axis is None:
+            raise ValueError("slice_axis must be provided for 3D NIfTI volumes")
+        axis_order = [slice_axis] + [axis for axis in range(2, -1, -1) if axis != slice_axis]
+        return imgs.transpose(*axis_order)[:, np.newaxis]
+
+    if imgs.ndim == 4:
+        if slice_axis is None:
+            raise ValueError("slice_axis must be provided for 4D NIfTI volumes")
+        spatial_axes = [axis for axis in range(2, -1, -1) if axis != slice_axis]
+        axis_order = [slice_axis, 3, *spatial_axes]
+        return imgs.transpose(*axis_order)
+
+    raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim} with {imgs.shape=}")
+
+
 def _read_slice_or_full(nibdata: SpatialImage,
                         slice_index: int | None,
-                        slice_axis: int | None) -> np.ndarray:
+                        slice_axis: int | None,
+                        plane: ViewPlane | None = None) -> np.ndarray:
     """
     Read a slice or the full volume from a NIfTI image.
     """
     if slice_index is not None:
-        if slice_axis is None:
-            shape = nibdata.shape
-            if len(shape) < 3:
-                raise ValueError("NIfTI image must be at least 3D to extract a slice")
-            if len(shape) == 3:
-                slice_axis = 2
-            else:
-                slice_axis = 3
-
-        return get_slice(nibdata, slice_index, slice_axis)
-
-    if slice_axis is not None:
-        raise ValueError("slice_index must be provided if slice_axis is provided")
+        requested_plane = _get_requested_plane(
+            slice_axis,
+            plane,
+            default_plane=DEFAULT_SLICE_PLANE,
+        )
+        return get_slice(nibdata, slice_index, slice_axis=slice_axis, plane=requested_plane)
 
     return nibdata.get_fdata()
 
@@ -62,7 +179,7 @@ def _open_stream(f_io: BinaryIO,
     try:
         if mimetype is None or mimetype in GZIP_MIME_TYPES:
             with gzip.open(f_io, 'rb') as f:
-                yield nib.Nifti1Image.from_stream(f)
+                yield Nifti1Image.from_stream(f)
                 return
     except gzip.BadGzipFile:
         pass  # Not a gzip file, try other methods
@@ -73,52 +190,79 @@ def _open_stream(f_io: BinaryIO,
 def read_nifti(file_path: str | Path | BinaryIO,
                mimetype: str | None = None,
                slice_index: int | None = None,
-               slice_axis: int | None = None) -> tuple[np.ndarray, SpatialImage]:
+               slice_axis: int | None = None,
+               plane: ViewPlane | None = None) -> tuple[np.ndarray, SpatialImage]:
     """
     Read a NIfTI file and return the image data in standardized format.
 
     Args:
         file_path: Path to the NIfTI file (.nii or .nii.gz)
         mimetype: Optional MIME type of the file. If provided, it can help in determining how to read the file.
+        slice_index: Optional slice index. When provided, the returned array is a
+            standardized slice with shape (C, H, W).
+        slice_axis: Optional spatial axis index (0, 1, or 2) used when
+            standardizing the output volume or when ``slice_index`` is provided.
+        plane: Optional anatomical plane used instead of ``slice_axis``. When a
+            plane is used, slices are ordered using the affine, but the image is
+            not otherwise rotated or canonicalized.
 
     Returns:
         np.ndarray: Image data with shape (#frames, C, H, W)
     """
-    if slice_axis is not None and slice_index is None:
-        raise ValueError("slice_index must be provided if slice_axis is provided")
-
     if isinstance(file_path, (str, Path)):
         try:
-            nibdata = nib.load(file_path)
-            imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+            nibdata = _load_spatial_image(file_path)
+            imgs = _read_slice_or_full(nibdata, slice_index, slice_axis, plane=plane)
         except ImageFileError:
             # it is possible that the file is a NIfTI file but with an unrecognized extension.
             with open(file_path, 'rb') as f:
                 with _open_stream(f, mimetype) as nibdata:
-                    imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+                    imgs = _read_slice_or_full(nibdata, slice_index, slice_axis, plane=plane)
     else:
         with _open_stream(file_path, mimetype) as nibdata:
-            imgs = _read_slice_or_full(nibdata, slice_index, slice_axis)
+            imgs = _read_slice_or_full(nibdata, slice_index, slice_axis, plane=plane)
 
-    if imgs.ndim == 2:
-        imgs = imgs.transpose(1, 0)
-        if slice_index is None:
-            imgs = imgs[np.newaxis, np.newaxis]
-        else:
-            imgs = imgs[np.newaxis]
-    elif imgs.ndim == 3 and slice_index is None:
-        imgs = imgs.transpose(2, 1, 0)
-        imgs = imgs[:, np.newaxis]
-    elif imgs.ndim == 4:
-        # (H, W, depth, C) -> (depth, C, H, W)
-        imgs = imgs.transpose(2, 3, 1, 0)
+    requested_plane = _get_requested_plane(
+        slice_axis,
+        plane,
+        default_plane=DEFAULT_SLICE_PLANE if len(nibdata.shape) >= 3 else None,
+    )
+    resolved_slice_axis = _resolve_slice_axis(nibdata, slice_axis=slice_axis, plane=requested_plane)
+    reverse_slice_order = (
+        resolved_slice_axis is not None
+        and _should_reverse_slice_order(nibdata, resolved_slice_axis, requested_plane)
+    )
+
+    if slice_index is None:
+        if reverse_slice_order:
+            imgs = np.flip(imgs, axis=resolved_slice_axis)
+        imgs = _standardize_volume_array(imgs, file_path, slice_axis=resolved_slice_axis)
     else:
-        raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim} with {imgs.shape=}")
+        imgs = _standardize_slice_array(imgs)
 
     # remove any cached data to free up memory
-    if hasattr(nibdata, 'uncache'):
-        nibdata.uncache()
+    uncache = getattr(nibdata, 'uncache', None)
+    if callable(uncache):
+        uncache()
     return imgs, nibdata
+
+
+def read_nifti_slice(file_path: str | Path | BinaryIO,
+                     slice_index: int,
+                     *,
+                     mimetype: str | None = None,
+                     slice_axis: int | None = None,
+                     plane: ViewPlane | None = None) -> tuple[np.ndarray, SpatialImage]:
+    """Read a single standardized slice from a NIfTI file.
+
+    The returned slice follows the same normalized layout used across the
+    package: (C, H, W), where grayscale slices have C=1.
+    """
+    return read_nifti(file_path,
+                      mimetype=mimetype,
+                      slice_index=slice_index,
+                      slice_axis=slice_axis,
+                      plane=_get_requested_plane(slice_axis, plane, default_plane=DEFAULT_SLICE_PLANE))
 
 
 def slice_location_to_slice_index(data: SpatialImage,
@@ -131,8 +275,9 @@ def slice_location_to_slice_index(data: SpatialImage,
     if slice_axis not in (0, 1, 2):
         raise ValueError("slice_axis must be 0, 1 or 2")
 
-    origin = data.affine[:3, 3]  # Location at voxel [0, 0, 0] in world coordinates. (translation vector)
-    rotation_matrix = data.affine[:3, :3]
+    affine = _get_affine(data)
+    origin = affine[:3, 3]  # Location at voxel [0, 0, 0] in world coordinates. (translation vector)
+    rotation_matrix = affine[:3, :3]
 
     # Get the directional vectors from the rotation matrix
     axis_vector = rotation_matrix[:, slice_axis]  # This is the direction of the slice axis in world coordinates
@@ -156,14 +301,14 @@ def coplanar_vector_to_slice_axis(data: SpatialImage,
     if not isinstance(coplanar_vector, np.ndarray) or coplanar_vector.ndim != 1 or coplanar_vector.size != 3:
         raise ValueError("coplanar_vector must be a 3-element numpy array")
 
-    rotation_matrix = data.affine[:3, :3]
+    rotation_matrix = _get_affine(data)[:3, :3]
     coplanar_vector = coplanar_vector / np.linalg.norm(coplanar_vector)  # Normalize the vector
 
     # Find the slice axis that is most aligned with the coplanar vector
     dot_products = np.abs(rotation_matrix.T @ coplanar_vector)
     slice_axis = np.argmin(dot_products)
 
-    return slice_axis
+    return int(slice_axis)
 
 
 def get_slice_location_from_slice_axis(data: SpatialImage,
@@ -177,7 +322,7 @@ def get_slice_location_from_slice_axis(data: SpatialImage,
     if slice_axis not in (0, 1, 2):
         raise ValueError("slice_axis must be 0, 1 or 2")
 
-    rotation_matrix = data.affine[:3, :3]
+    rotation_matrix = _get_affine(data)[:3, :3]
     axis_vector = rotation_matrix[:, slice_axis]  # This is the direction of the slice axis in world coordinates
     world_slice_axis = np.argmax(np.abs(axis_vector))
     return world_point[world_slice_axis]
@@ -196,7 +341,12 @@ def line_to_slice_index(data: SpatialImage,
         raise ValueError("Either world_point1 and world_point2 or coplanar_vector must be provided")
 
     if world_point1 is not None:
+        if world_point2 is None:
+            raise ValueError("world_point2 must be provided when world_point1 is provided")
         coplanar_vector = world_point2 - world_point1
+
+    if world_point1 is None or coplanar_vector is None:
+        raise ValueError("world_point1 and coplanar_vector are required to compute the slice index")
 
     slice_axis = coplanar_vector_to_slice_axis(data, coplanar_vector)
     slice_location = get_slice_location_from_slice_axis(data, world_point1, slice_axis)
@@ -215,46 +365,47 @@ def get_slice_from_line(data: SpatialImage,
     Get the slice 2D image from a line defined by two points in world coordinates.
     """
     slice_index, slice_axis = line_to_slice_index(data, world_point1, world_point2)
-    return get_slice(data, slice_index, slice_axis)
+    return get_slice(data, slice_index, slice_axis=slice_axis)
 
 
 def get_slice(data: SpatialImage,
               slice_index: int,
-              slice_axis: int) -> np.ndarray:
+              slice_axis: int | None = None,
+              plane: ViewPlane | None = None) -> np.ndarray:
     """
-    Get a 2D slice from a 3D NIfTI volume based on the slice index and axis.
+    Get a slice from a 3D or 4D NIfTI volume based on the slice index and axis.
 
     Args:
         data (SpatialImage): The NIfTI image data whose slice is to be extracted.
         slice_index (int): The index of the slice to extract.
-        slice_axis (int): The axis along which to extract the slice (0 for x, 1 for y, 2 for z).
+        slice_axis (int | None): The spatial axis along which to extract the
+            slice (0 for x, 1 for y, 2 for z).
+        plane (str | None): Optional anatomical plane name used instead of
+            ``slice_axis``.
 
     Returns:
-        np.ndarray: The extracted 2D slice image with shape (W, H).
+        np.ndarray: The extracted slice. For 3D data the result is 2D. For 4D
+            data the trailing dimension is preserved.
     """
-    # Check the on-disk data order ('C' or 'F')
-    # 'C' means C-contiguous (row-major), fastest changing is the first index.
-    # Slicing the first axis (e.g., r.dataobj[0, :, :]) is fastest for 'C' order.
-    # 'F' means Fortran-contiguous (column-major), fastest changing is the last index.
-    # Slicing the last axis (e.g., r.dataobj[:, :, 0]) is fastest for 'F' order.
-    dataorder = data.dataobj.order
+    requested_plane = _get_requested_plane(slice_axis, plane, default_plane=DEFAULT_SLICE_PLANE)
+    resolved_slice_axis = _resolve_slice_axis(data, slice_axis=slice_axis, plane=requested_plane)
+    if resolved_slice_axis is None:
+        raise ValueError("Could not resolve a slice axis for this NIfTI image")
 
-    if slice_axis == 0:
-        if dataorder == 'C':
-            slice_image = data.dataobj[slice_index, :, :]
-        else:
-            slice_image = data.get_fdata()[slice_index, :, :]
-    elif slice_axis == 1:
-        slice_image = data.get_fdata()[:, slice_index, :]
-    elif slice_axis == 2:
-        if dataorder == 'F':
-            slice_image = data.dataobj[:, :, slice_index]
-        else:
-            slice_image = data.get_fdata()[:, :, slice_index]
-    else:
-        raise ValueError(f"Invalid slice axis: {slice_axis}. Must be 0, 1, or 2.")
+    raw_slice_index = _normalize_slice_index(
+        slice_index,
+        data.shape[resolved_slice_axis],
+        _should_reverse_slice_order(data, resolved_slice_axis, requested_plane),
+    )
 
-    return slice_image
+    slicer: list[slice | int] = [slice(None)] * len(data.shape)
+    slicer[resolved_slice_axis] = raw_slice_index
+    indexer = tuple(slicer)
+
+    try:
+        return np.asarray(data.dataobj[indexer])
+    except Exception:
+        return np.asarray(data.get_fdata()[indexer])
 
 
 def is_nifti_file(file_path: Path | str) -> bool:
@@ -339,24 +490,7 @@ def get_plane_axis(data: SpatialImage,
         int: The axis index corresponding to the specified plane (0, 1, or 2).
 
     """
-    valid_planes = {"axial", "sagittal", "coronal"}
-
-    if plane not in valid_planes:
-        raise ValueError(f"Invalid plane '{plane}'. Must be one of {valid_planes}.")
-
-    # Extract the orientation codes (e.g., ('R', 'A', 'S'))
-    axcodes = nib.orientations.aff2axcodes(data.affine)
-
-    # Sagittal slices move along the Left/Right (X) axis
-    # Coronal slices move along the Anterior/Posterior (Y) axis
-    # Axial slices move along the Inferior/Superior (Z) axis
-    target_codes = _PLANES_TO_CODES[plane]
-
-    for axis_index, code in enumerate(axcodes):
-        if code in target_codes:
-            return axis_index
-
-    raise RuntimeError(f"Could not map the {plane} plane from affine codes: {axcodes}")
+    return _get_plane_axis(data, plane)
 
 
 axis_name_to_axis_index = get_plane_axis  # alias for backward compatibility
@@ -394,7 +528,7 @@ def get_nifti_shape(file_path: str) -> tuple[int, ...]:
         tuple[int, ...]: Shape of the NIfTI image (X, Y, Z)
     """
     try:
-        return nib.load(file_path).shape
+        return _load_spatial_image(file_path).shape
     except ImageFileError as e:
         from .format_detection import guess_type
         mimetype, _ = guess_type(file_path)
@@ -402,11 +536,11 @@ def get_nifti_shape(file_path: str) -> tuple[int, ...]:
             raise
         if mimetype in GZIP_MIME_TYPES:
             with gzip.open(file_path, 'rb') as f:
-                nibdata = nib.Nifti1Image.from_stream(f)
+                nibdata = Nifti1Image.from_stream(f)
                 return nibdata.shape
         elif mimetype in NIFTI_MIMES:
             with open(file_path, 'rb') as f:
-                nibdata = nib.Nifti1Image.from_stream(f)
+                nibdata = Nifti1Image.from_stream(f)
                 return nibdata.shape
         else:
             raise
@@ -439,7 +573,7 @@ def world_to_voxel(data: SpatialImage,
         raise ValueError("world_coords must be either 1D or 2D numpy array.")
 
     # 1. Convert world coordinates to voxel coordinates
-    inv_affine = np.linalg.inv(data.affine)
+    inv_affine = np.linalg.inv(_get_affine(data))
     # Add homogeneous coordinate (w=1)
     points_hom = np.hstack((world_coords, np.ones((world_coords.shape[0], 1))))
     # Apply inverse affine transformation

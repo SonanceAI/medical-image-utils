@@ -45,12 +45,20 @@ patient_coords = mik.pixel_to_patient(ds, pixel_x=100, pixel_y=150)
 ```python
 import nibabel as nib
 import medimgkit as mik
+from medimgkit.nifti_utils import read_nifti_slice
 
 # Load NIfTI file
 nifti_data = nib.load('path/to/image.nii.gz')
 
 # Get a specific slice
 slice_image = mik.get_slice(nifti_data, slice_index=50, slice_axis=2)
+
+# Read a slice by anatomical plane while preserving native slice orientation
+slice_image, nifti_img = read_nifti_slice(
+	'path/to/image.nii.gz',
+	slice_index=50,
+	plane='coronal',
+)
 
 # Convert world coordinates to slice index
 slice_idx, axis = mik.line_to_slice_index(nifti_data, point1, point2)
@@ -87,7 +95,8 @@ image_array = mik.read_array_normalized('path/to/image.png')
 ### NIfTI Utils (`medimgkit.nifti_utils`)
 
 #### Slice Operations
-- `get_slice(data, slice_index, slice_axis)`: Extract 2D slice from 3D volume
+- `get_slice(data, slice_index, slice_axis=None, plane=None)`: Extract a slice from a 3D/4D volume
+- `read_nifti_slice(file_path, slice_index, plane=None)`: Read one standardized slice in `(C, H, W)` format while preserving native orientation
 - `get_slice_from_line(data, world_point1, world_point2)`: Get slice defined by line
 - `slice_location_to_slice_index(data, slice_location, slice_axis)`: Convert location to index
 
@@ -103,7 +112,7 @@ image_array = mik.read_array_normalized('path/to/image.png')
 #### Reading Functions
 - `read_array_normalized(file_path, index=None, return_metainfo=False, use_magic=False)`: Universal image reader
 - `read_image(file_path)`: Read standard image formats (PNG, JPEG)
-- `read_nifti(file_path, mimetype=None)`: Read NIfTI files
+- `read_nifti(file_path, mimetype=None, slice_index=None, plane=None)`: Read NIfTI files and optionally order slices by anatomical plane
 - `read_video(file_path, index=None)`: Read video files
 
 ## Supported Formats
