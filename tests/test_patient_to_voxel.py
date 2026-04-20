@@ -114,3 +114,28 @@ class TestPatientToVoxel:
         )
         
         assert np.allclose(points_patient, reconverted_pts)
+
+    def test_going_back_and_forth_with_asymmetric_spacing(self):
+        ds = pydicom.Dataset()
+        ds.ImagePositionPatient = [0, 0, 0]
+        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+        ds.PixelSpacing = [2.0, 3.0]
+        ds.SpacingBetweenSlices = 4.0
+        ds.NumberOfFrames = 1
+
+        points_patient = np.array([
+            [6.0, 8.0, 0.0],
+            [9.0, 4.0, 0.0],
+        ])
+
+        vox_coords = patient_to_voxel(ds, points_patient)
+        assert np.allclose(vox_coords, [[2.0, 4.0, 0.0], [3.0, 2.0, 0.0]])
+
+        reconverted_pts = pixel_to_patient(
+            ds,
+            vox_coords[:, 0],
+            vox_coords[:, 1],
+            slice_index=vox_coords[:, 2].astype(int),
+        )
+
+        assert np.allclose(points_patient, reconverted_pts)

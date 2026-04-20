@@ -1455,7 +1455,7 @@ def get_pixel_spacing(ds: pydicom.Dataset, slice_index: int) -> np.ndarray:
         slice_index (int): Index of the slice in the 3D volume.
 
     Returns:
-        numpy.ndarray: Pixel spacing (X, Y) for the specified slice.
+        numpy.ndarray: Pixel spacing as [row_spacing, col_spacing] for the specified slice.
     """
     # Get the Pixel Spacing attribute
     if 'PixelSpacing' in ds:
@@ -1838,10 +1838,10 @@ def patient_to_voxel(ds: pydicom.Dataset,
     abs_dists = np.abs(dists)
     k_indices = np.argmin(abs_dists, axis=1)  # (M,)
 
-    # 2. Find pixel coordinates (i, j) on the nearest slice
-    # Project point onto slice plane.
-    # i = (P - O_k) . row / spacing_x
-    # j = (P - O_k) . col / spacing_y
+    # 2. Find pixel coordinates (pixel_x, pixel_y) on the nearest slice.
+    # DICOM PixelSpacing is [row_spacing, col_spacing]:
+    # - pixel_x is the column index and advances along the row direction.
+    # - pixel_y is the row index and advances along the column direction.
 
     nearest_origins = origins[k_indices]  # (M, 3)
     nearest_rows = row_vectors[k_indices]  # (M, 3)
@@ -1850,8 +1850,8 @@ def patient_to_voxel(ds: pydicom.Dataset,
 
     vec_PO = patient_coords - nearest_origins  # (M, 3)
 
-    i_coords = np.sum(vec_PO * nearest_rows, axis=1) / nearest_spacings[:, 0]
-    j_coords = np.sum(vec_PO * nearest_cols, axis=1) / nearest_spacings[:, 1]
+    i_coords = np.sum(vec_PO * nearest_rows, axis=1) / nearest_spacings[:, 1]
+    j_coords = np.sum(vec_PO * nearest_cols, axis=1) / nearest_spacings[:, 0]
     k_coords = k_indices.astype(float)
 
     voxel_coords = np.stack([i_coords, j_coords, k_coords], axis=1)
