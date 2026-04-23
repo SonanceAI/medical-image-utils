@@ -39,6 +39,9 @@ anonymized_ds = mik.anonymize_dicom(ds)
 
 # Convert pixel coordinates to patient coordinates
 patient_coords = mik.pixel_to_patient(ds, pixel_x=100, pixel_y=150)
+
+# Use a specific native axis or anatomical plane when working with reformatted slices
+coronal_coords = mik.pixel_to_patient(ds, pixel_x=80, pixel_y=20, slice_index=120, axis_index='coronal')
 ```
 
 ### NIfTI Operations
@@ -85,7 +88,7 @@ image_array = mik.read_array_normalized('path/to/image.png')
 - `is_dicom(f)`: Check if file is a DICOM
 
 #### Coordinate Conversion
-- `pixel_to_patient(ds, pixel_x, pixel_y, slice_index=None)`: Convert pixel to patient coordinates
+- `pixel_to_patient(ds, pixel_x, pixel_y, slice_index=None, axis_index=None)`: Convert pixel to patient coordinates, optionally along a native axis or anatomical plane
 - `get_image_position(ds, slice_index=None)`: Get image position in patient coordinates
 - `get_pixel_spacing(ds, slice_index)`: Get pixel spacing information
 

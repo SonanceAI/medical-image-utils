@@ -1552,52 +1552,149 @@ def _extract_geometry(ds: pydicom.Dataset) -> tuple[np.ndarray, np.ndarray, np.n
     return origins, row_vectors, col_vectors, spacings
 
 
+def _resolve_pixel_to_patient_axis_index(ds: pydicom.Dataset,
+                                         axis: int | ViewPlane | None) -> int:
+    if axis is None:
+        return 0
+
+    if isinstance(axis, str):
+        resolved_axis_index = get_plane_axis(ds, axis)
+        if resolved_axis_index is None:
+            raise ValueError(
+                f"Could not determine axis_index for plane '{axis}' in DICOM dataset. "
+                "The data may be too oblique or missing orientation information.")
+        return resolved_axis_index
+
+    if axis not in (0, 1, 2):
+        raise ValueError(f"Invalid axis {axis}. Must be 0, 1, or 2.")
+
+    return axis
+
+
+def _get_dicom_axis_size(ds: pydicom.Dataset, axis_index: int) -> int:
+    if axis_index == 0:
+        return get_number_of_slices(ds)
+    if axis_index == 1:
+        return int(ds.Rows)
+    if axis_index == 2:
+        return int(ds.Columns)
+    raise ValueError(f"Invalid axis_index {axis_index}. Must be 0, 1, or 2.")
+
+
+def _normalize_pixel_to_patient_slice_index(ds: pydicom.Dataset,
+                                            axis_index: int,
+                                            slice_index: int | np.ndarray | None,
+                                            instance_number: int | None) -> np.ndarray:
+    if slice_index is not None and instance_number is not None:
+        raise ValueError("Either slice_index or instance_number should be provided, not both.")
+
+    if instance_number is not None and axis_index != 0:
+        raise ValueError("instance_number is only supported when axis_index resolves to 0.")
+
+    axis_size = _get_dicom_axis_size(ds, axis_index)
+
+    if slice_index is None:
+        if axis_index == 0:
+            if instance_number is None:
+                instance_number = _get_instance_number(ds)
+
+            root_instance_number = ds.get('InstanceNumber', 1)
+            if root_instance_number is None:
+                root_instance_number = 1
+            slice_index = instance_number - root_instance_number
+        elif axis_size == 1:
+            slice_index = 0
+        else:
+            raise ValueError(
+                f"slice_index is required when axis_index is {axis_index} and the selected axis has more than one element.")
+
+    slice_index_arr = np.asarray(slice_index, dtype=np.float64)
+    rounded_slice_index = np.rint(slice_index_arr)
+    if not np.allclose(slice_index_arr, rounded_slice_index):
+        raise ValueError("slice_index must contain integer indices.")
+
+    normalized_slice_index = np.atleast_1d(rounded_slice_index.astype(int))
+    if np.any((normalized_slice_index < 0) | (normalized_slice_index >= axis_size)):
+        raise ValueError(
+            f"slice_index contains values outside the valid range [0, {axis_size - 1}].")
+
+    return normalized_slice_index
+
+
+def _slice_pixels_to_voxel_coords(pixel_x: np.ndarray,
+                                  pixel_y: np.ndarray,
+                                  slice_index: np.ndarray,
+                                  axis_index: int) -> np.ndarray:
+    if axis_index == 0:
+        return np.stack([pixel_x, pixel_y, slice_index], axis=1)
+    if axis_index == 1:
+        return np.stack([pixel_x, slice_index, pixel_y], axis=1)
+    if axis_index == 2:
+        return np.stack([slice_index, pixel_x, pixel_y], axis=1)
+    raise ValueError(f"Invalid axis_index {axis_index}. Must be 0, 1, or 2.")
+
+
 def pixel_to_patient(ds: pydicom.Dataset,
                      pixel_x: float | np.ndarray,
                      pixel_y: float | np.ndarray,
                      slice_index: int | np.ndarray | None = None,
-                     instance_number: int | None = None) -> np.ndarray:
+                     instance_number: int | None = None,
+                     axis: int | ViewPlane | None = None) -> np.ndarray:
     """
     Convert pixel coordinates (pixel_x, pixel_y) to patient coordinates in DICOM.
 
     Parameters:
         ds (pydicom.Dataset): The DICOM dataset containing image metadata.
-        pixel_x (float | np.ndarray): X coordinate in pixel space (column index).
-        pixel_y (float | np.ndarray): Y coordinate in pixel space (row index).
-        slice_index (int | np.ndarray): Index of the slice of the `ds.pixel_array`.
-        instance_number (int): Instance number of the slice in the 3D volume.
+        pixel_x (float | np.ndarray): Horizontal coordinate in the selected 2D slice.
+        pixel_y (float | np.ndarray): Vertical coordinate in the selected 2D slice.
+        slice_index (int | np.ndarray | None): Index of the selected slice along
+            ``axis``. Defaults to the native DICOM frame axis when
+            ``axis`` is not provided.
+        instance_number (int | None): DICOM Instance Number of the selected
+            native frame. Only supported when ``axis`` resolves to 0.
+        axis (int | ViewPlane | None): Native axis to slice along. Accepts
+            ``0``, ``1``, ``2`` or a ``ViewPlane`` string (``'axial'``,
+            ``'sagittal'``, ``'coronal'``). When omitted, preserves the legacy
+            behavior and uses the native frame/slice axis.
 
 
     Returns:
         numpy.ndarray: Patient coordinates (X, Y, Z).
+
+    Notes:
+        - ``axis=0`` uses native per-frame DICOM geometry and supports
+          variable frame positions/orientations.
+        - ``axis=1`` corresponds to ``ds.pixel_array[:, slice_index, :]``.
+        - ``axis=2`` corresponds to ``ds.pixel_array[:, :, slice_index]``.
+        - Non-zero ``axis`` values require a consistent 3D affine and may
+          raise ``InconsistentDICOMFramesError`` for irregular stacks.
     """
 
     # - image_position is the origin of the image in patient coordinates (ImagePositionPatient)
     # - row_vector and col_vector are the direction cosines from ImageOrientationPatient
     # - pixel_spacing is the physical distance between the centers of adjacent pixels
 
-    if slice_index is not None and instance_number is not None:
-        raise ValueError("Either slice_index or instance_number should be provided, not both.")
+    resolved_axis_index = _resolve_pixel_to_patient_axis_index(ds, axis)
+    slice_index_arr = _normalize_pixel_to_patient_slice_index(
+        ds,
+        resolved_axis_index,
+        slice_index,
+        instance_number,
+    )
 
     # Normalize inputs to arrays
-    pixel_x = np.atleast_1d(pixel_x)
-    pixel_y = np.atleast_1d(pixel_y)
+    pixel_x_arr, pixel_y_arr, slice_index_arr = np.broadcast_arrays(
+        np.atleast_1d(np.asarray(pixel_x, dtype=np.float64)),
+        np.atleast_1d(np.asarray(pixel_y, dtype=np.float64)),
+        slice_index_arr,
+    )
+    pixel_x_arr = pixel_x_arr.reshape(-1)
+    pixel_y_arr = pixel_y_arr.reshape(-1)
+    slice_index_arr = slice_index_arr.reshape(-1)
+    is_single_point = pixel_x_arr.size == 1
 
-    if slice_index is None:
-        if instance_number is None:
-            instance_number = _get_instance_number(ds)
-
-        # If instance_number is provided, convert to slice_index
-        root_instance_number = ds.get('InstanceNumber', 1)
-        if root_instance_number is None:
-            root_instance_number = 1
-        slice_index = instance_number - root_instance_number
-
-    slice_index = np.atleast_1d(slice_index)
-
-    # If slice_index is scalar (size 1), we can use the fast path (single geometry).
-    if slice_index.size == 1:
-        idx = int(slice_index[0])
+    if resolved_axis_index == 0 and np.all(slice_index_arr == slice_index_arr[0]):
+        idx = int(slice_index_arr[0])
         image_position = np.array(get_image_position(ds, idx), dtype=np.float64)
         image_orientation = np.array(get_image_orientation(ds, idx), dtype=np.float64).reshape(2, 3)
         pixel_spacing = np.array(get_pixel_spacing(ds, idx), dtype=np.float64)
@@ -1605,54 +1702,57 @@ def pixel_to_patient(ds: pydicom.Dataset,
         row_vector = image_orientation[0]
         col_vector = image_orientation[1]
 
-        # pixel_x: (N,), pixel_y: (N,)
+        # pixel_x_arr: (N,), pixel_y_arr: (N,)
         # result: (N, 3)
 
-        # We need to reshape pixel_x/y for broadcasting
-        px = pixel_x[:, np.newaxis]  # (N, 1)
-        py = pixel_y[:, np.newaxis]  # (N, 1)
+        px = pixel_x_arr[:, np.newaxis]  # (N, 1)
+        py = pixel_y_arr[:, np.newaxis]  # (N, 1)
 
         # DICOM PixelSpacing is [row_spacing, col_spacing]
-        # - pixel_x is column index (moves along row_vector) -> uses col_spacing
-        # - pixel_y is row index (moves along col_vector) -> uses row_spacing
+        # - pixel_x is horizontal axis in the selected slice
+        # - pixel_y is vertical axis in the selected slice
         patient_coords = image_position + px * pixel_spacing[1] * row_vector + py * pixel_spacing[0] * col_vector
 
-        if patient_coords.shape[0] == 1:
+        if is_single_point:
             return patient_coords[0]
         return patient_coords
 
-    else:
-        # Vectorized path using _extract_geometry
-        # We need geometry for all slices, then index with slice_index
+    if resolved_axis_index == 0:
         origins, row_vectors, col_vectors, spacings = _extract_geometry(ds)
 
-        # slice_index might contain indices.
-        # Ensure integer
-        idxs = slice_index.astype(int)
+        idxs = slice_index_arr.astype(int)
 
-        # Select geometry
         my_origins = origins[idxs]  # (N, 3)
         my_rows = row_vectors[idxs]  # (N, 3)
         my_cols = col_vectors[idxs]  # (N, 3)
         my_spacings = spacings[idxs]  # (N, 2)
 
-        # Reshape for (N, 3) output
-        # px: (N, 1)
-        px = pixel_x
-        if px.ndim == 1:
-            px = px[:, np.newaxis]
-
-        py = pixel_y
-        if py.ndim == 1:
-            py = py[:, np.newaxis]
+        px = pixel_x_arr[:, np.newaxis]
+        py = pixel_y_arr[:, np.newaxis]
 
         # DICOM PixelSpacing is [row_spacing, col_spacing]
         term1 = px * my_spacings[:, 1:2] * my_rows
         term2 = py * my_spacings[:, 0:1] * my_cols
 
         patient_coords = my_origins + term1 + term2
-
+        if is_single_point:
+            return patient_coords[0]
         return patient_coords
+
+    affine = build_affine_matrix(ds)
+    voxel_coords = _slice_pixels_to_voxel_coords(
+        pixel_x_arr,
+        pixel_y_arr,
+        slice_index_arr.astype(np.float64),
+        resolved_axis_index,
+    )
+    points_hom = np.hstack((voxel_coords, np.ones((voxel_coords.shape[0], 1), dtype=np.float64)))
+    patient_coords = points_hom @ affine.T
+    patient_coords = patient_coords[:, :3]
+
+    if is_single_point:
+        return patient_coords[0]
+    return patient_coords
 
 
 def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
