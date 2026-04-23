@@ -211,7 +211,8 @@ def read_nifti(file_path: str | Path | BinaryIO,
                mimetype: str | None = None,
                slice_index: int | None = None,
                slice_axis: int | None = None,
-               plane: ViewPlane | None = None) -> tuple[np.ndarray, SpatialImage]:
+               plane: ViewPlane | None = None,
+               orientation_normalized: bool = False) -> tuple[np.ndarray, SpatialImage]:
     """
     Read a NIfTI file and return the image data in standardized format.
 
@@ -225,6 +226,8 @@ def read_nifti(file_path: str | Path | BinaryIO,
         plane: Optional anatomical plane used instead of ``slice_axis``. When a
             plane is used, slices are ordered using the affine, but the image is
             not otherwise rotated or canonicalized.
+        orientation_normalized: If True, the returned full volume is reoriented to a standard orientation (RAS) and slice order is determined by the affine.
+            This has no effect when ``slice_index`` is provided.
 
     Returns:
         np.ndarray: Image data with shape (#frames, C, H, W)
@@ -242,17 +245,30 @@ def read_nifti(file_path: str | Path | BinaryIO,
         with _open_stream(file_path, mimetype) as nibdata:
             imgs = _read_slice_or_full(nibdata, slice_index, slice_axis, plane=plane)
 
-    _, resolved_slice_axis, reverse_slice_order = _resolve_slice_context(
-        nibdata,
-        slice_axis,
-        plane,
-        default_plane=DEFAULT_SLICE_PLANE if len(nibdata.shape) >= 3 else None,
-    )
-
     if slice_index is None:
-        if reverse_slice_order:
-            imgs = np.flip(imgs, axis=resolved_slice_axis)
-        imgs = _standardize_volume_array(imgs, file_path, slice_axis=resolved_slice_axis)
+        if orientation_normalized:
+            # TODO: consider using `nib.as_closest_canonical(nibdata)`
+            _, resolved_slice_axis, reverse_slice_order = _resolve_slice_context(
+                nibdata,
+                slice_axis,
+                plane,
+                default_plane=DEFAULT_SLICE_PLANE if len(nibdata.shape) >= 3 else None,
+            )
+            if reverse_slice_order:
+                imgs = np.flip(imgs, axis=resolved_slice_axis)
+            imgs = _standardize_volume_array(imgs, file_path, slice_axis=resolved_slice_axis)
+        else:
+            if imgs.ndim == 3:
+                # (row, col, slice) -> (slice, 1, row, col)
+                imgs = imgs.transpose(2, 0, 1)[:, np.newaxis]
+            elif imgs.ndim == 4:
+                # (row, col, slice, time) -> (slice, time, row, col)
+                imgs = imgs.transpose(2, 3, 0, 1)
+            elif imgs.ndim == 2:
+                # (row, col) -> (1, 1, row, col)
+                imgs = imgs[np.newaxis, np.newaxis]
+            else:
+                raise ValueError(f"Unsupported number of dimensions in '{file_path}': {imgs.ndim} with {imgs.shape=}")
     else:
         imgs = _standardize_slice_array(imgs)
 

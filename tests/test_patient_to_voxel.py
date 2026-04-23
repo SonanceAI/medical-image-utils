@@ -139,3 +139,59 @@ class TestPatientToVoxel:
         )
 
         assert np.allclose(points_patient, reconverted_pts)
+
+    def test_pixel_to_patient_with_axis_index_uses_requested_native_axis(self):
+        ds = pydicom.Dataset()
+        ds.NumberOfFrames = 5
+        ds.Rows = 6
+        ds.Columns = 7
+
+        ds.PerFrameFunctionalGroupsSequence = pydicom.Sequence()
+        for i in range(5):
+            frame = pydicom.Dataset()
+
+            plane_pos = pydicom.Dataset()
+            plane_pos.ImagePositionPatient = [0, 0, i * 3.0]
+            frame.PlanePositionSequence = pydicom.Sequence([plane_pos])
+
+            plane_orient = pydicom.Dataset()
+            plane_orient.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+            frame.PlaneOrientationSequence = pydicom.Sequence([plane_orient])
+
+            pixel_measures = pydicom.Dataset()
+            pixel_measures.PixelSpacing = [2.0, 2.0]
+            frame.PixelMeasuresSequence = pydicom.Sequence([pixel_measures])
+
+            ds.PerFrameFunctionalGroupsSequence.append(frame)
+
+        pt = pixel_to_patient(ds, pixel_x=2, pixel_y=3, slice_index=1, axis=1)
+
+        assert np.allclose(pt, [4.0, 2.0, 9.0])
+
+    def test_pixel_to_patient_axis_index_accepts_view_plane_name(self):
+        ds = pydicom.Dataset()
+        ds.NumberOfFrames = 5
+        ds.Rows = 6
+        ds.Columns = 7
+
+        ds.PerFrameFunctionalGroupsSequence = pydicom.Sequence()
+        for i in range(5):
+            frame = pydicom.Dataset()
+
+            plane_pos = pydicom.Dataset()
+            plane_pos.ImagePositionPatient = [0, 0, i * 3.0]
+            frame.PlanePositionSequence = pydicom.Sequence([plane_pos])
+
+            plane_orient = pydicom.Dataset()
+            plane_orient.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+            frame.PlaneOrientationSequence = pydicom.Sequence([plane_orient])
+
+            pixel_measures = pydicom.Dataset()
+            pixel_measures.PixelSpacing = [2.0, 2.0]
+            frame.PixelMeasuresSequence = pydicom.Sequence([pixel_measures])
+
+            ds.PerFrameFunctionalGroupsSequence.append(frame)
+
+        pt = pixel_to_patient(ds, pixel_x=1, pixel_y=4, slice_index=2, axis='sagittal')
+
+        assert np.allclose(pt, [4.0, 2.0, 12.0])
