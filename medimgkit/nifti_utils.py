@@ -235,6 +235,10 @@ def read_nifti(file_path: str | Path | BinaryIO,
     if isinstance(file_path, (str, Path)):
         try:
             nibdata = _load_spatial_image(file_path)
+            # if 3d, shape is (sagittal, coronal, axial).
+            # If 4d, shape is (sagittal, coronal, axial, time).
+            # TODO: consider using `nib.funcs.as_closest_canonical(nibdata)`
+            # nibdata = nib.funcs.as_closest_canonical(nibdata)
             imgs = _read_slice_or_full(nibdata, slice_index, slice_axis, plane=plane)
         except ImageFileError:
             # it is possible that the file is a NIfTI file but with an unrecognized extension.
@@ -247,7 +251,6 @@ def read_nifti(file_path: str | Path | BinaryIO,
 
     if slice_index is None:
         if orientation_normalized:
-            # TODO: consider using `nib.as_closest_canonical(nibdata)`
             _, resolved_slice_axis, reverse_slice_order = _resolve_slice_context(
                 nibdata,
                 slice_axis,
