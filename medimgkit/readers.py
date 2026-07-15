@@ -163,7 +163,7 @@ def read_array_normalized(file_path: str | BinaryIO | bytes,
         if mime_type.split('/')[-1] == 'dicom':
             if not is_path:
                 file_path.seek(0)
-            ds = pydicom.dcmread(file_path)
+            ds = pydicom.dcmread(file_path, force=True)
             if index is not None:
                 imgs, _ = read_dicom(ds, index=index)
                 imgs = imgs[0]

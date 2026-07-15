@@ -84,7 +84,7 @@ class ModalityDetector:
         try:
             dcm = pydicom.dcmread(str(file_path),
                                   specific_tags=['Modality', 'SOPClassUID'],
-                                  stop_before_pixels=True)
+                                  stop_before_pixels=True, force=True)
 
             # Primary method: Check Modality tag (0008,0060)
             if hasattr(dcm, 'Modality'):

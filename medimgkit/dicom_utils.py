@@ -84,9 +84,9 @@ class _AssembleDicomSource:
                 with peek(io_source):
                     if self.source_offset is not None:
                         io_source.seek(self.source_offset)
-                    dicom = pydicom.dcmread(io_source)
+                    dicom = pydicom.dcmread(io_source, force=True)
             else:
-                dicom = pydicom.dcmread(self.source)
+                dicom = pydicom.dcmread(self.source, force=True)
         except pydicom.errors.InvalidDicomError as e:
             _add_source_name_to_invalid_dicom_error(e, self.source)
             raise
@@ -131,11 +131,11 @@ def _read_dicom_metadata_for_assembly(source: str | IO,
             with peek(io_source):
                 dicom = pydicom.dcmread(io_source,
                                         stop_before_pixels=True,
-                                        specific_tags=list(specific_tags))
+                                        specific_tags=list(specific_tags), force=True)
         else:
             dicom = pydicom.dcmread(source,
                                     stop_before_pixels=True,
-                                    specific_tags=list(specific_tags))
+                                    specific_tags=list(specific_tags), force=True)
     except pydicom.errors.InvalidDicomError as e:
         _add_source_name_to_invalid_dicom_error(e, source)
         raise
@@ -2355,7 +2355,7 @@ def is_dicom_report(file_path: str | IO | pydicom.Dataset) -> bool:
                     file_obj.seek(start_pos)
                     ds = pydicom.dcmread(file_obj,
                                          specific_tags=['Modality'],
-                                         stop_before_pixels=True)
+                                         stop_before_pixels=True, force=True)
                     modality = _normalize_dicom_code_string(getattr(ds, 'Modality', None))
         elif isinstance(file_path, pydicom.Dataset):
             modality = _normalize_dicom_code_string(getattr(file_path, 'Modality', None))
@@ -2366,7 +2366,7 @@ def is_dicom_report(file_path: str | IO | pydicom.Dataset) -> bool:
             if modality is _FAST_DICOM_SCAN_FALLBACK:
                 ds = pydicom.dcmread(path,
                                      specific_tags=['Modality'],
-                                     stop_before_pixels=True)
+                                     stop_before_pixels=True, force=True)
                 modality = _normalize_dicom_code_string(getattr(ds, 'Modality', None))
 
         # Common report modalities
@@ -2419,7 +2419,7 @@ def parse_dicomdir_files(dicomdir_path: Path) -> list[Path]:
     """
     try:
         # Read the DICOMDIR file
-        dicomdir_ds = pydicom.dcmread(str(dicomdir_path))
+        dicomdir_ds = pydicom.dcmread(str(dicomdir_path), force=True)
 
         if 'DirectoryRecordSequence' not in dicomdir_ds:
             _LOGGER.warning(f"No DirectoryRecordSequence found in DICOMDIR: {dicomdir_path}")
@@ -2846,7 +2846,7 @@ def read_dicom_standardized(
     """
     # Read DICOM file
     if isinstance(filepath, (str, Path)):
-        ds = dcmread(filepath)
+        ds = dcmread(filepath, force=True)
     else:
         ds = filepath
 
