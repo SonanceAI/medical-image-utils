@@ -83,12 +83,16 @@ image_array = mik.read_array_normalized('path/to/image.png')
 
 #### Core Functions
 - `load_image_normalized(dicom, index=None)`: Load and normalize DICOM pixel data
+- `read_dicom_standardized(filepath, index=None, ..., frame_order='geometric')`: Read pixel data as `(N, C, H, W)`. Multi-frame volumes are returned in geometric order (matching the Datamint web viewer); pass `frame_order='stored'` for the legacy on-disk order
+- `compute_geometric_frame_order(ds, reference_index=0)`: Frame indices in the order Cornerstone displays them
 - `anonymize_dicom(ds, retain_codes=[], copy=False, token_mapper=None)`: Anonymize DICOM following standards
 - `assemble_dicoms(files_path, return_as_IO=False)`: Combine multiple DICOMs into multi-frame
 - `is_dicom(f)`: Check if file is a DICOM
 
 #### Coordinate Conversion
-- `pixel_to_patient(ds, pixel_x, pixel_y, slice_index=None, axis_index=None)`: Convert pixel to patient coordinates, optionally along a native axis or anatomical plane
+- `pixel_to_patient(ds, pixel_x, pixel_y, slice_index=None, axis_index=None, frame_order='geometric')`: Convert pixel to patient coordinates, optionally along a native axis or anatomical plane
+- `patient_to_voxel(ds, patient_coords, frame_order='geometric')`: Convert patient coordinates to voxel coordinates
+- `build_affine_matrix(ds, frame_order='geometric')`: Build the voxel-to-patient affine
 - `get_image_position(ds, slice_index=None)`: Get image position in patient coordinates
 - `get_pixel_spacing(ds, slice_index)`: Get pixel spacing information
 

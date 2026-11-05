@@ -1480,9 +1480,191 @@ def get_number_of_slices(ds: pydicom.Dataset) -> int:
     return int(n)
 
 
-def _extract_geometry(ds: pydicom.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def compute_geometric_frame_order(
+    ds: pydicom.Dataset,
+    *,
+    reference_index: int = 0,
+) -> np.ndarray:
+    """Return frame indices in the order the Datamint web viewer displays them.
+
+    Mirrors Cornerstone's ``sortImageIdsAndGetSpacing``: frames are sorted by
+    their distance along the slice normal, measured from ``reference_index``,
+    in descending order.
+
+    Args:
+        ds: DICOM dataset, single- or multi-frame.
+        reference_index: Frame used as the distance origin. Cornerstone uses
+            the first image id, i.e. ``0``.
+
+    Returns:
+        Integer index array of length ``get_number_of_slices(ds)``. Identity
+        when the stored order already matches the geometric order, when the
+        dataset has a single frame, or when the geometry is unavailable.
+    """
+    n_frames = get_number_of_slices(ds)
+    identity = np.arange(n_frames, dtype=int)
+    if n_frames <= 1:
+        return identity
+
+    try:
+        iop = np.asarray(get_image_orientation(ds, 0), dtype=np.float64).reshape(-1)
+    except (ValueError, TypeError):
+        return identity
+    if iop.size != 6 or not np.all(np.isfinite(iop)):
+        return identity
+
+    normal = np.cross(iop[:3], iop[3:])
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_norm) or normal_norm == 0.0:
+        return identity
+    normal = normal / normal_norm
+
+    positions = np.empty((n_frames, 3), dtype=np.float64)
+    for i in range(n_frames):
+        try:
+            position = np.asarray(get_image_position(ds, i), dtype=np.float64).reshape(-1)
+        except (ValueError, TypeError, IndexError):
+            return identity
+        if position.size != 3 or not np.all(np.isfinite(position)):
+            return identity
+        positions[i] = position
+
+    reference_position = positions[reference_index]
+    # Cornerstone sorts descending by dot(reference - position, normal).
+    # Negating the distances and using a stable sort keeps ties in stored order.
+    distances = (reference_position - positions) @ normal
+    return np.argsort(-distances, kind='stable').astype(int)
+
+
+def _iter_frame_increment_pointers(ds: pydicom.Dataset) -> list[BaseTag]:
+    pointer = ds.get('FrameIncrementPointer')
+    if pointer is None:
+        return []
+    if isinstance(pointer, (list, tuple, pydicom.multival.MultiValue)):
+        return [Tag(p) for p in pointer]
+    return [Tag(pointer)]
+
+
+def _reorder_pixel_data(ds: pydicom.Dataset,
+                        order: np.ndarray,
+                        raw_frames: np.ndarray | None = None) -> None:
+    """Reorder ``PixelData`` in place for uncompressed transfer syntaxes.
+
+    Compressed pixel data cannot be reordered without re-encoding, so it is
+    left untouched; callers should rely on the returned array in that case.
+
+    Args:
+        ds: Dataset whose ``PixelData`` should be reordered.
+        order: Frame index order to apply.
+        raw_frames: Already-decoded raw pixel array (frame axis first). When
+            omitted, ``PixelData`` is decoded here.
+    """
+    if 'PixelData' not in ds:
+        return
+    file_meta = getattr(ds, 'file_meta', None)
+    transfer_syntax = getattr(file_meta, 'TransferSyntaxUID', None)
+    if transfer_syntax is not None and transfer_syntax.is_compressed:
+        return
+
+    frames = raw_frames
+    if frames is None:
+        try:
+            frames = pixel_array(ds, raw=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOGGER.debug("Could not decode PixelData for reordering: %s", exc)
+            return
+
+    if frames.ndim < 3 or frames.shape[0] != order.size:
+        return
+
+    element = ds['PixelData']
+    ds[element.tag] = pydicom.DataElement(
+        element.tag, element.VR, frames[order].tobytes())
+    ds._pixel_array = None
+    ds._pixel_id = {}
+
+
+def _reorder_dataset_frames(ds: pydicom.Dataset,
+                            order: np.ndarray,
+                            raw_frames: np.ndarray | None = None) -> pydicom.Dataset:
+    """Return a copy of ``ds`` whose per-frame sequences follow ``order``.
+
+    ``SharedFunctionalGroupsSequence`` is shared across frames and is left
+    untouched. Top-level attributes are also left untouched: for datasets
+    without per-frame sequences the frame positions are derived from
+    ``InstanceNumber`` and always advance along the slice normal, so their
+    geometric order is the stored order.
+
+    The returned dataset shares its data elements with ``ds``. Per-frame
+    sequences are rebuilt, and ``PixelData`` is reordered in place when the
+    transfer syntax is uncompressed so that ``pixel_array`` matches the
+    returned array.
+
+    Args:
+        ds: Source dataset.
+        order: Frame index order to apply.
+        raw_frames: Already-decoded raw pixel array (frame axis first), used to
+            avoid decoding ``PixelData`` twice.
+    """
+    order = np.asarray(order, dtype=int)
+    n_frames = int(order.size)
+
+    reordered = pydicom.Dataset()
+    reordered.file_meta = ds.file_meta
+    for element in ds:
+        reordered[element.tag] = element
+    # Drop any cached decoded pixel array: it still reflects the stored order.
+    reordered._pixel_array = None
+    reordered._pixel_id = {}
+
+    _reorder_pixel_data(reordered, order, raw_frames=raw_frames)
+
+    def _reorder_sequence(keyword: str) -> None:
+        if keyword not in reordered:
+            return
+        element = reordered[keyword]
+        sequence = element.value
+        if not isinstance(sequence, pydicom.Sequence) or len(sequence) != n_frames:
+            return
+        reordered[element.tag] = pydicom.DataElement(
+            element.tag, element.VR, pydicom.Sequence([sequence[int(i)] for i in order]))
+
+    _reorder_sequence('PerFrameFunctionalGroupsSequence')
+    _reorder_sequence('DetectorInformationSequence')
+
+    for tag in _iter_frame_increment_pointers(reordered):
+        keyword = pydicom.datadict.keyword_for_tag(tag)
+        if not keyword or keyword in (
+            'PerFrameFunctionalGroupsSequence',
+            'SharedFunctionalGroupsSequence',
+            'DetectorInformationSequence',
+        ):
+            continue
+        _reorder_sequence(keyword)
+
+    return reordered
+
+
+def _resolve_frame_order(ds: pydicom.Dataset,
+                         frame_order: Literal['geometric', 'stored']) -> np.ndarray:
+    """Return the frame index order selected by ``frame_order``."""
+    n_frames = get_number_of_slices(ds)
+    if frame_order == 'stored':
+        return np.arange(n_frames, dtype=int)
+    if frame_order == 'geometric':
+        return compute_geometric_frame_order(ds)
+    raise ValueError(f"frame_order must be 'geometric' or 'stored', got {frame_order!r}")
+
+
+def _extract_geometry(ds: pydicom.Dataset,
+                      frame_order: Literal['geometric', 'stored'] = 'geometric'
+                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract geometry (origins, row_vectors, col_vectors, spacings) for all frames.
+
+    Frames are returned in the order selected by ``frame_order`` (geometric by
+    default), matching the arrays returned by ``read_dicom_standardized``.
+
     Returns:
         origins: (N, 3)
         row_vectors: (N, 3)
@@ -1548,6 +1730,13 @@ def _extract_geometry(ds: pydicom.Dataset) -> tuple[np.ndarray, np.ndarray, np.n
             row_vectors[i] = orient[:3]
             col_vectors[i] = orient[3:]
             spacings[i] = get_pixel_spacing(ds, i)
+
+    order = _resolve_frame_order(ds, frame_order)
+    if not np.array_equal(order, np.arange(num_frames)):
+        origins = origins[order]
+        row_vectors = row_vectors[order]
+        col_vectors = col_vectors[order]
+        spacings = spacings[order]
 
     return origins, row_vectors, col_vectors, spacings
 
@@ -1639,7 +1828,8 @@ def pixel_to_patient(ds: pydicom.Dataset,
                      pixel_y: float | np.ndarray,
                      slice_index: int | np.ndarray | None = None,
                      instance_number: int | None = None,
-                     axis: int | ViewPlane | None = None) -> np.ndarray:
+                     axis: int | ViewPlane | None = None,
+                     frame_order: Literal['geometric', 'stored'] = 'geometric') -> np.ndarray:
     """
     Convert pixel coordinates (pixel_x, pixel_y) to patient coordinates in DICOM.
 
@@ -1668,6 +1858,9 @@ def pixel_to_patient(ds: pydicom.Dataset,
         - ``axis=2`` corresponds to ``ds.pixel_array[:, :, slice_index]``.
         - Non-zero ``axis`` values require a consistent 3D affine and may
           raise ``InconsistentDICOMFramesError`` for irregular stacks.
+        - ``frame_order`` selects the frame indexing convention. ``'geometric'``
+          (default) matches the arrays returned by ``read_dicom_standardized``
+          and the Datamint web viewer; ``'stored'`` uses the on-disk order.
     """
 
     # - image_position is the origin of the image in patient coordinates (ImagePositionPatient)
@@ -1695,9 +1888,10 @@ def pixel_to_patient(ds: pydicom.Dataset,
 
     if resolved_axis_index == 0 and np.all(slice_index_arr == slice_index_arr[0]):
         idx = int(slice_index_arr[0])
-        image_position = np.array(get_image_position(ds, idx), dtype=np.float64)
-        image_orientation = np.array(get_image_orientation(ds, idx), dtype=np.float64).reshape(2, 3)
-        pixel_spacing = np.array(get_pixel_spacing(ds, idx), dtype=np.float64)
+        stored_idx = int(_resolve_frame_order(ds, frame_order)[idx])
+        image_position = np.array(get_image_position(ds, stored_idx), dtype=np.float64)
+        image_orientation = np.array(get_image_orientation(ds, stored_idx), dtype=np.float64).reshape(2, 3)
+        pixel_spacing = np.array(get_pixel_spacing(ds, stored_idx), dtype=np.float64)
 
         row_vector = image_orientation[0]
         col_vector = image_orientation[1]
@@ -1718,7 +1912,7 @@ def pixel_to_patient(ds: pydicom.Dataset,
         return patient_coords
 
     if resolved_axis_index == 0:
-        origins, row_vectors, col_vectors, spacings = _extract_geometry(ds)
+        origins, row_vectors, col_vectors, spacings = _extract_geometry(ds, frame_order=frame_order)
 
         idxs = slice_index_arr.astype(int)
 
@@ -1755,15 +1949,20 @@ def pixel_to_patient(ds: pydicom.Dataset,
     return patient_coords
 
 
-def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
+def build_affine_matrix(ds: pydicom.Dataset,
+                        frame_order: Literal['geometric', 'stored'] = 'geometric') -> np.ndarray:
     """
     Build the affine transformation matrix from voxel coordinates to patient coordinates.
-    Important: Assumes that the DICOM dataset represents a 3D volume and that 
+    Important: Assumes that the DICOM dataset represents a 3D volume and that
     the Slice Thickness, Spacing Between Slices and Image Orientation is constant across slices.
     Also, it checks PerFrameFunctionalGroupsSequence to see if these Image Orientation and Position attributes are present and constant there.
 
     Args:
         ds (pydicom.Dataset): The DICOM dataset containing image metadata.
+        frame_order (Literal['geometric', 'stored']): Frame indexing convention.
+            ``'geometric'`` (default) describes the frame order returned by
+            ``read_dicom_standardized`` and the Datamint web viewer;
+            ``'stored'`` describes the on-disk order.
 
     Returns:
         np.ndarray: A (4x4) Transformation matrix similar to the one used in NIfTI files.
@@ -1791,8 +1990,15 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
             raise ValueError(f"{name} has zero/invalid norm")
         return v / n
 
+    # Map logical (returned) frame indices to stored frame indices.
+    n_frames = int(get_number_of_slices(ds) or 1)
+    order = _resolve_frame_order(ds, frame_order)
+
+    def _stored_index(logical_index: int) -> int:
+        return int(order[logical_index])
+
     # Base (slice 0) geometry
-    pixel_spacing = np.asarray(get_pixel_spacing(ds, slice_index=0), dtype=np.float64).reshape(-1)
+    pixel_spacing = np.asarray(get_pixel_spacing(ds, slice_index=_stored_index(0)), dtype=np.float64).reshape(-1)
     if pixel_spacing.size != 2:
         raise ValueError(f"PixelSpacing must have 2 values, got {pixel_spacing.size}")
 
@@ -1800,27 +2006,26 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
     row_spacing = float(pixel_spacing[0])
     col_spacing = float(pixel_spacing[1])
 
-    iop = _as_iop6(get_image_orientation(ds, slice_index=0))
+    iop = _as_iop6(get_image_orientation(ds, slice_index=_stored_index(0)))
     row_dir = _normed(_as_vec3(iop[:3], "Row direction"), "Row direction")
     col_dir = _normed(_as_vec3(iop[3:], "Column direction"), "Column direction")
     # Slice direction: right-handed system in DICOM patient coordinates (LPS)
     slice_dir = _normed(np.cross(row_dir, col_dir), "Slice direction")
 
-    origin = _as_vec3(get_image_position(ds, slice_index=0), "ImagePositionPatient")
+    origin = _as_vec3(get_image_position(ds, slice_index=_stored_index(0)), "ImagePositionPatient")
 
     # Determine slice spacing (mm). Prefer measuring from positions when possible.
-    n_frames = int(get_number_of_slices(ds) or 1)
-
     slice_spacing: float
     if n_frames > 1:
         p0 = origin
-        p1 = _as_vec3(get_image_position(ds, slice_index=1), "ImagePositionPatient")
+        p1 = _as_vec3(get_image_position(ds, slice_index=_stored_index(1)), "ImagePositionPatient")
         diff01 = (p1 - p0).astype(np.float64)
         proj01 = float(np.dot(diff01, slice_dir))
         if not np.isfinite(proj01) or np.isclose(proj01, 0.0):
             raise InconsistentDICOMFramesError(
                 "Cannot infer slice spacing from positions: adjacent frames have ~zero separation along slice normal")
-        # Keep sign so the affine matches stored frame order.
+        # Keep sign so the affine matches the frame order returned by
+        # read_dicom_standardized (geometric by default), not the on-disk order.
         slice_spacing = proj01
         _LOGGER.debug(f"Inferred slice spacing from positions: {slice_spacing:.4f} mm")
     else:
@@ -1836,20 +2041,20 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
 
         # Check orientations + pixel spacing are constant
         for idx in sample_indices:
-            iop_i = _as_iop6(get_image_orientation(ds, slice_index=int(idx)))
+            iop_i = _as_iop6(get_image_orientation(ds, slice_index=_stored_index(int(idx))))
             if not np.allclose(iop_i, iop0, atol=1e-4, rtol=0):
                 raise InconsistentDICOMFramesError(
                     "ImageOrientationPatient varies across frames; cannot build a single affine")
-            ps_i = np.asarray(get_pixel_spacing(ds, slice_index=int(idx)), dtype=np.float64).reshape(-1)
+            ps_i = np.asarray(get_pixel_spacing(ds, slice_index=_stored_index(int(idx))), dtype=np.float64).reshape(-1)
             if ps_i.size != 2 or not np.allclose(ps_i, ps0, atol=1e-6, rtol=0):
                 raise InconsistentDICOMFramesError("PixelSpacing varies across frames; cannot build a single affine")
 
         # Check that frame positions advance consistently along the slice normal
         # and are not oblique to the slice axis.
-        prev_pos = _as_vec3(get_image_position(ds, slice_index=0), "ImagePositionPatient")
+        prev_pos = _as_vec3(get_image_position(ds, slice_index=_stored_index(0)), "ImagePositionPatient")
         step_projs: list[float] = []
         for idx in sample_indices[1:]:
-            cur_pos = _as_vec3(get_image_position(ds, slice_index=int(idx)), "ImagePositionPatient")
+            cur_pos = _as_vec3(get_image_position(ds, slice_index=_stored_index(int(idx))), "ImagePositionPatient")
             diff = (cur_pos - prev_pos).astype(np.float64)
             proj = float(np.dot(diff, slice_dir))
             # Remove the component along slice_dir and ensure the remainder is small
@@ -1890,7 +2095,8 @@ def build_affine_matrix(ds: pydicom.Dataset) -> np.ndarray:
 
 
 def patient_to_voxel(ds: pydicom.Dataset,
-                     patient_coords: np.ndarray) -> np.ndarray:
+                     patient_coords: np.ndarray,
+                     frame_order: Literal['geometric', 'stored'] = 'geometric') -> np.ndarray:
     """
     Convert patient coordinates (x, y, z) to voxel coordinates (pixel_x, pixel_y, slice_index).
 
@@ -1900,6 +2106,9 @@ def patient_to_voxel(ds: pydicom.Dataset,
     Args:
         ds (pydicom.Dataset): The DICOM dataset containing image metadata.
         patient_coords (np.ndarray): Patient coordinates (shape: (N, 3) or (3,)).
+        frame_order (Literal['geometric', 'stored']): Frame indexing convention.
+            ``'geometric'`` (default) matches the arrays returned by
+            ``read_dicom_standardized``; ``'stored'`` uses the on-disk order.
 
     Returns:
         np.ndarray: Voxel coordinates (shape: (N, 3) or (3,)).
@@ -1917,7 +2126,8 @@ def patient_to_voxel(ds: pydicom.Dataset,
     is_single_point = patient_coords.ndim == 1
     patient_coords = np.atleast_2d(patient_coords)  # (M, 3)
 
-    origins, row_vectors, col_vectors, spacings = _extract_geometry(ds)  # (N, 3), (N, 3), (N, 3), (N, 2)
+    origins, row_vectors, col_vectors, spacings = _extract_geometry(
+        ds, frame_order=frame_order)  # (N, 3), (N, 3), (N, 3), (N, 2)
 
     # Calculate slice normals: row x col
     slice_normals = np.cross(row_vectors, col_vectors)  # (N, 3)
@@ -2780,7 +2990,8 @@ def read_dicom_standardized(
     convert_to_rgb: bool = True,
     apply_modality_lut: bool = True,
     apply_presentation_lut: bool = True,
-    normalize: bool = False
+    normalize: bool = False,
+    frame_order: Literal['geometric', 'stored'] = 'geometric',
 ) -> tuple[np.ndarray, pydicom.Dataset]:
     """
     Read a DICOM file and return pixel data in standardized (N, C, H, W) format.
@@ -2817,6 +3028,13 @@ def read_dicom_standardized(
         are always brighter, regardless of the PhotometricInterpretation.
     normalize : bool, default=False
         If True, normalize pixel values to [0, 1] range
+    frame_order : {'geometric', 'stored'}, default='geometric'
+        Frame ordering convention for multi-frame volumes.
+        - ``'geometric'``: frames are sorted the way the Datamint web viewer
+          (Cornerstone) displays them, i.e. descending by distance along the
+          slice normal. This keeps arrays aligned with web-written masks.
+        - ``'stored'``: legacy behaviour, frames are returned in the order
+          they are stored in the file.
 
     Returns
     -------
@@ -2827,7 +3045,8 @@ def read_dicom_standardized(
         - H: Height
         - W: Width
     dataset : pydicom.Dataset
-        The DICOM dataset object containing all metadata and tags
+        The DICOM dataset object containing all metadata and tags. When frames
+        are reordered, per-frame sequences are reordered to match the array.
 
     Examples
     --------
@@ -2853,6 +3072,8 @@ def read_dicom_standardized(
     # Get number of frames and validate index
 
     num_frames = int(ds.get('NumberOfFrames', 1))
+    single_frame_requested = index is not None
+    raw_frames = None
     if index is not None:
         if index < 0 or index >= num_frames:
             raise ValueError(f"Index {index} is out of bounds. The number of frames is {num_frames}.")
@@ -2861,6 +3082,10 @@ def read_dicom_standardized(
         num_frames = 1
     else:
         arr = pixel_array(ds, raw=not convert_to_rgb)
+        if not convert_to_rgb:
+            # Keep the raw frames so the dataset's PixelData can be reordered
+            # without decoding it a second time.
+            raw_frames = arr
 
     # Store the photometric interpretation before any modifications
     photometric_interp = str(ds.get('PhotometricInterpretation', 'UNKNOWN'))
@@ -2886,6 +3111,21 @@ def read_dicom_standardized(
 
     # Standardize to (N, C, H, W) format using robust shape disambiguation
     arr = standardize_array_shape(ds, arr=arr)
+
+    # Reorder frames to match the Datamint web viewer (Cornerstone) unless the
+    # caller explicitly asked for the on-disk order or a single frame.
+    if frame_order not in ('geometric', 'stored'):
+        raise ValueError(f"frame_order must be 'geometric' or 'stored', got {frame_order!r}")
+    if frame_order == 'geometric' and not single_frame_requested and arr.shape[0] > 1:
+        order = compute_geometric_frame_order(ds)
+        if order.size == arr.shape[0] and not np.array_equal(order, np.arange(order.size)):
+            _LOGGER.info(
+                "Reordering %d DICOM frames into geometric order for %s.",
+                order.size,
+                ds.get('SOPInstanceUID', '<unknown SOPInstanceUID>'),
+            )
+            arr = arr[order]
+            ds = _reorder_dataset_frames(ds, order, raw_frames=raw_frames)
 
     # Normalize if requested
     if normalize:
